@@ -20,6 +20,14 @@ struct ClaudeSession: Identifiable, Sendable, Equatable {
     let status: SessionStatus
     let lastSeen: Date
     let lastActivity: Date?    // tmux session_activity — last input/output timestamp
+    let machine: String?       // nil = local-only discovery, "MBP M4" etc. from mesh
+    let machineHost: String?   // nil or "local" = this machine, "100.x.x.x:3456" = remote peer
+
+    /// Whether this session lives on a remote machine (needs WebSocket proxy).
+    var isRemote: Bool {
+        guard let host = machineHost else { return false }
+        return host != "local"
+    }
 
     var displayName: String {
         if let name = tmuxSession, !name.isEmpty {

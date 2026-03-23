@@ -4,6 +4,7 @@ import SwiftUI
 struct SessionSidebarView: View {
     var store: NotificationStore
     var onSelectSession: (ClaudeSession) -> Void
+    var onReconnectSession: ((ClaudeSession) -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -57,6 +58,9 @@ struct SessionSidebarView: View {
                         .contextMenu {
                             if session.terminalTarget != nil {
                                 Button("Open Terminal") { onSelectSession(session) }
+                                Button("Reconnect") {
+                                    onReconnectSession?(session)
+                                }
                             }
                             Divider()
                             Button("Remove from Sidebar", role: .destructive) {
@@ -94,10 +98,22 @@ struct SessionRowView: View {
                 .frame(width: 7, height: 7)
                 .shadow(color: statusColor.opacity(0.6), radius: statusGlow ? 3 : 0)
             VStack(alignment: .leading, spacing: 2) {
-                Text(session.displayName)
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                HStack(spacing: 4) {
+                    Text(session.displayName)
+                        .font(.callout)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if session.isRemote, let machine = session.machine {
+                        let mc = MachineColors.color(for: machine)
+                        Text(machine)
+                            .font(.system(size: 9, weight: .medium))
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(mc.background)
+                            .foregroundStyle(mc.foreground)
+                            .clipShape(RoundedRectangle(cornerRadius: 3))
+                    }
+                }
                 Text(session.agent)
                     .font(.caption2)
                     .foregroundStyle(.tertiary)

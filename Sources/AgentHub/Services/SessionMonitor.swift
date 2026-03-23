@@ -1,10 +1,23 @@
 import Foundation
 
 /// Discovers Claude Code sessions via ps + tmux + enrichment from session files.
+/// When the All My Agents web server is running on localhost:3456, uses its
+/// mesh API for multi-machine session discovery. Falls back to local-only
+/// tmux discovery when the server is unavailable.
 @MainActor
 final class SessionMonitor {
     private let store: NotificationStore
     private var timer: Timer?
+
+    /// Mesh API backoff: skip mesh attempts for N polls after a failure
+    /// to avoid 2-second timeouts on every 1-second poll when the server is down.
+    private var meshSkipRemaining: Int = 0
+    private static let meshBackoffPolls = 5
+
+    /// Whether we've ever had a successful mesh response. When true and mesh
+    /// temporarily fails, we keep the last known sessions instead of falling
+    /// back to local-only (which would cause remote sessions to flicker away).
+    private var meshEverSucceeded: Bool = false
 
     init(store: NotificationStore) {
         self.store = store
@@ -26,6 +39,38 @@ final class SessionMonitor {
 
     private func poll() {
         Task.detached(priority: .utility) { [weak self] in
+            // Try mesh API first (multi-machine), fall back to local discovery
+            let meshSkip = await MainActor.run { self?.meshSkipRemaining ?? 0 }
+
+            if meshSkip <= 0 {
+                if let meshSessions = await MeshAPIClient.fetchMeshSessions() {
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.meshSkipRemaining = 0
+                        self.meshEverSucceeded = true
+                        self.store.updateSessions(meshSessions)
+                        self.syncNotifications(sessions: meshSessions)
+                    }
+                    return
+                } else {
+                    let wasConnected = await MainActor.run { self?.meshEverSucceeded ?? false }
+                    await MainActor.run { [weak self] in
+                        self?.meshSkipRemaining = Self.meshBackoffPolls
+                    }
+                    // If mesh was previously working, keep the last known sessions
+                    // rather than falling back to local-only (which drops remote sessions).
+                    if wasConnected { return }
+                }
+            } else {
+                let wasConnected = await MainActor.run { self?.meshEverSucceeded ?? false }
+                await MainActor.run { [weak self] in
+                    self?.meshSkipRemaining -= 1
+                }
+                // During backoff, keep last known sessions if mesh was previously working
+                if wasConnected { return }
+            }
+
+            // Fallback: local-only tmux discovery (only reached if mesh never succeeded)
             // 1. Discover Claude processes via ps
             let psOutput = await Self.runProcess("/bin/ps", arguments: ["-eo", "pid,tty,args"])
             let processes = Self.parseProcesses(from: psOutput)
@@ -72,7 +117,9 @@ final class SessionMonitor {
                     agent: agent,
                     status: status,
                     lastSeen: Date(),
-                    lastActivity: tmuxInfo?.activity
+                    lastActivity: tmuxInfo?.activity,
+                    machine: nil,
+                    machineHost: nil
                 )
             }
 
@@ -97,7 +144,9 @@ final class SessionMonitor {
                     agent: agent,
                     status: status,
                     lastSeen: Date(),
-                    lastActivity: paneInfo.activity
+                    lastActivity: paneInfo.activity,
+                    machine: nil,
+                    machineHost: nil
                 ))
             }
 

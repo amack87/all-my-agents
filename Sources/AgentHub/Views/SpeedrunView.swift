@@ -169,7 +169,7 @@ struct SpeedrunView: View {
     }
 
     private func terminalArea(for notification: AgentNotification, target: String) -> some View {
-        TerminalContainerView(target: target, zoomLevel: store.zoomLevel)
+        TerminalContainerView(target: target, machineHost: nil, zoomLevel: store.zoomLevel)
             .id(target)
             .onAppear {
                 setupForAgent(notification)

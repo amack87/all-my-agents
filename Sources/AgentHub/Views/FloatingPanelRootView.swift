@@ -3,18 +3,23 @@ import SwiftUI
 /// Root view — sidebar + main content area.
 struct FloatingPanelRootView: View {
     var store: NotificationStore
-    @State private var activeTerminalTarget: String? = nil
+    @State private var activeTerminal: TerminalTarget? = nil
     @State private var showingSpeedrun: Bool = false
+
+    struct TerminalTarget: Equatable {
+        let target: String
+        let machineHost: String?
+    }
 
     enum MainPanel {
         case list
-        case terminal(String)
+        case terminal(TerminalTarget)
         case speedrun
     }
 
     private var activePanel: MainPanel {
         if showingSpeedrun { return .speedrun }
-        if let target = activeTerminalTarget { return .terminal(target) }
+        if let t = activeTerminal { return .terminal(t) }
         return .list
     }
 
@@ -23,6 +28,8 @@ struct FloatingPanelRootView: View {
             if store.sidebarVisible {
                 SessionSidebarView(store: store, onSelectSession: { session in
                     selectSession(session)
+                }, onReconnectSession: { session in
+                    reconnectSession(session)
                 })
                 Divider()
             }
@@ -43,11 +50,11 @@ struct FloatingPanelRootView: View {
         case .speedrun:
             SpeedrunView(store: store, onExit: {
                 showingSpeedrun = false
-                activeTerminalTarget = nil
+                activeTerminal = nil
                 store.stopSpeedrun()
             })
-        case .terminal(let target):
-            terminalMode(target: target)
+        case .terminal(let t):
+            terminalMode(target: t.target, machineHost: t.machineHost)
         case .list:
             listMode
         }
@@ -58,7 +65,7 @@ struct FloatingPanelRootView: View {
             store: store,
             onOpenTerminal: { notification in
                 if let target = notification.tmuxPane ?? notification.tmuxSession {
-                    activeTerminalTarget = target
+                    activeTerminal = TerminalTarget(target: target, machineHost: nil)
                 }
             },
             onSelectSession: { session in
@@ -71,10 +78,10 @@ struct FloatingPanelRootView: View {
         )
     }
 
-    private func terminalMode(target: String) -> some View {
+    private func terminalMode(target: String, machineHost: String?) -> some View {
         VStack(spacing: 0) {
             HStack {
-                Button(action: { activeTerminalTarget = nil }) {
+                Button(action: { activeTerminal = nil }) {
                     Label("Back", systemImage: "chevron.left")
                 }
                 .buttonStyle(.borderless)
@@ -93,13 +100,17 @@ struct FloatingPanelRootView: View {
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             Divider()
-            TerminalContainerView(target: target, zoomLevel: store.zoomLevel)
-                .id(target)
+            TerminalContainerView(
+                target: target,
+                machineHost: machineHost,
+                zoomLevel: store.zoomLevel
+            )
+            .id("\(machineHost ?? "local"):\(target)")
         }
     }
 
     private func startSpeedrun() {
-        activeTerminalTarget = nil
+        activeTerminal = nil
         store.startSpeedrun()
         showingSpeedrun = true
     }
@@ -113,7 +124,18 @@ struct FloatingPanelRootView: View {
         store.stopSpeedrun()
         store.selectSession(session.id)
         if let target = session.terminalTarget {
-            activeTerminalTarget = target
+            activeTerminal = TerminalTarget(target: target, machineHost: session.machineHost)
+        }
+    }
+
+    /// Force-reconnect by clearing the terminal and re-opening after a tick.
+    private func reconnectSession(_ session: ClaudeSession) {
+        activeTerminal = nil
+        store.selectSession(session.id)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            if let target = session.terminalTarget {
+                activeTerminal = TerminalTarget(target: target, machineHost: session.machineHost)
+            }
         }
     }
 }
