@@ -1,4 +1,4 @@
-# AgentHub
+# AllMyAgents
 
 A macOS app for monitoring and managing multiple Claude Code agent sessions running in tmux. Provides a unified UI with webhook notifications, embedded terminals, session discovery, and speedrun mode for rapidly cycling through agents that need your input.
 
