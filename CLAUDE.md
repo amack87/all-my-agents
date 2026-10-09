@@ -10,6 +10,14 @@ swift build -c release  # Compile only (no bundle assembly)
 
 No test suite exists yet. Verify changes by building and manually testing in the app.
 
+**SDK workaround (required on this dev machine)**: the Command Line Tools 27.0 toolchain does not ship the `SwiftUIMacros` plugin (and no Xcode is installed), so a plain `swift build` fails on every SwiftUI file with `plugin for module 'SwiftUIMacros' not found`. Point the build at the 26.5 SDK:
+
+```bash
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./build.sh
+```
+
+`-Xswiftc -sdk …` is ignored (SwiftPM injects its own `-sdk` afterwards); use `SDKROOT=` or `swift build --sdk …`. Workaround is only for building here — the resulting app is unaffected.
+
 ## Key Constraints
 
 - **tmux 3.6a crash**: NEVER use `new-session -t` (grouped sessions). Always use `attach-session`. Grouped sessions trigger a use-after-free in `server_destroy_session_group`. See TerminalSession.swift comments.
