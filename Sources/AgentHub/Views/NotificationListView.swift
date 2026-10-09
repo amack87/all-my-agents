@@ -6,6 +6,12 @@ struct NotificationListView: View {
     var onSelectSession: ((ClaudeSession) -> Void)? = nil
     var onStartSpeedrun: (() -> Void)? = nil
 
+    @State private var showRenameAlert = false
+    @State private var renameText = ""
+    @State private var sessionToRename: ClaudeSession? = nil
+    @State private var showKillConfirmation = false
+    @State private var sessionToKill: ClaudeSession? = nil
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerView
@@ -16,6 +22,43 @@ struct NotificationListView: View {
         }
         .frame(minWidth: 380)
         .frame(minHeight: 80, maxHeight: .infinity)
+        .alert("Rename Session", isPresented: $showRenameAlert, presenting: sessionToRename) { session in
+            TextField("New name", text: $renameText)
+            Button("Rename") {
+                renameSession(session, to: renameText)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Rename \"\(session.displayName)\" to:")
+        }
+        .alert("Kill Session", isPresented: $showKillConfirmation, presenting: sessionToKill) { session in
+            Button("Kill", role: .destructive) {
+                killSession(session)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Are you sure you want to kill tmux session \"\(session.displayName)\"?")
+        }
+    }
+
+    private func renameSession(_ session: ClaudeSession, to newName: String) {
+        guard let tmuxSession = session.tmuxSession, !newName.isEmpty else { return }
+        Task {
+            let success = await TmuxHelpers.renameSession(currentName: tmuxSession, newName: newName)
+            if success {
+                await MainActor.run { store.hideSession(session) }
+            }
+        }
+    }
+
+    private func killSession(_ session: ClaudeSession) {
+        guard let name = session.tmuxSession else { return }
+        Task {
+            let success = await TmuxHelpers.killSession(named: name)
+            if success {
+                await MainActor.run { store.hideSession(session) }
+            }
+        }
     }
 
     private var headerView: some View {
@@ -71,8 +114,63 @@ struct NotificationListView: View {
                         }
                         .contextMenu {
                             if session.terminalTarget != nil {
-                                Button("Open Terminal") {
-                                    onSelectSession?(session)
+                                Button("Open Terminal") { onSelectSession?(session) }
+                            }
+                            if session.tmuxSession != nil {
+                                Divider()
+                                Button("Rename Session") {
+                                    sessionToRename = session
+                                    renameText = session.displayName
+                                    showRenameAlert = true
+                                }
+                                Button("Kill Session", role: .destructive) {
+                                    sessionToKill = session
+                                    showKillConfirmation = true
+                                }
+                            }
+                            Divider()
+                            Button("Copy Session Info") {
+                                let info = """
+                                Name: \(session.displayName)
+                                Agent: \(session.agent)
+                                Status: \(statusLabelText(for: session))
+                                Project: \(session.projectPath ?? "N/A")
+                                Machine: \(session.machine ?? "local")
+                                """
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(info, forType: .string)
+                            }
+                            Divider()
+                            if !store.groupNames.isEmpty || session.tmuxSession != nil {
+                                Menu("Assign to Group") {
+                                    ForEach(store.groupNames, id: \.self) { group in
+                                        Button(group) {
+                                            store.assignSession(session, toGroup: group)
+                                        }
+                                    }
+                                    if store.groupName(for: session) != nil {
+                                        Button("Remove from Group", role: .destructive) {
+                                            store.assignSession(session, toGroup: nil)
+                                        }
+                                    }
+                                    Divider()
+                                    Button("New Group...") {
+                                        let alert = NSAlert()
+                                        alert.messageText = "New Group"
+                                        alert.informativeText = "Enter a name for the new group:"
+                                        alert.addButton(withTitle: "Create")
+                                        alert.addButton(withTitle: "Cancel")
+                                        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
+                                        alert.accessoryView = input
+                                        alert.beginSheetModal(for: NSApp.keyWindow ?? NSWindow()) { response in
+                                            if response == .alertFirstButtonReturn {
+                                                let name = input.stringValue.trimmingCharacters(in: .whitespaces)
+                                                if !name.isEmpty {
+                                                    store.assignSession(session, toGroup: name)
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Divider()
@@ -177,6 +275,15 @@ struct NotificationListView: View {
     }
 
     // MARK: - Helpers
+
+    func statusLabelText(for session: ClaudeSession) -> String {
+        switch session.status {
+        case .needsInput: return "needs input"
+        case .working: return "working"
+        case .idle: return "idle"
+        case .unknown: return "unknown"
+        }
+    }
 
     private func notificationFor(_ session: ClaudeSession) -> AgentNotification? {
         let target = session.terminalTarget

@@ -445,14 +445,21 @@ struct AddSessionSheet: View {
         }
     }
 
-    /// Path to claude-hibernator CLI. Set HIBERNATOR_CLI env var or defaults to
-    /// ~/Repos/claude-hibernator/cli.py. Returns nil if not found.
+    /// Path to the hibernator CLI. Set HIBERNATOR_CLI env var or probe the
+    /// known install locations (the repo was renamed claude-hibernator →
+    /// tmux-agent-hibernator). Returns nil if not found.
     private static var hibernatorCLI: String? = {
         if let envPath = ProcessInfo.processInfo.environment["HIBERNATOR_CLI"] {
             return FileManager.default.isReadableFile(atPath: envPath) ? envPath : nil
         }
-        let defaultPath = NSHomeDirectory() + "/Repos/claude-hibernator/cli.py"
-        return FileManager.default.isReadableFile(atPath: defaultPath) ? defaultPath : nil
+        let home = NSHomeDirectory()
+        let candidates = [
+            home + "/Repos/tmux-agent-hibernator/cli.py",
+            home + "/Repos/claude-hibernator/cli.py",
+            home + "/.local/bin/claude-hibernator/cli.py",
+            home + "/claude-hibernator/cli.py",
+        ]
+        return candidates.first { FileManager.default.isReadableFile(atPath: $0) }
     }()
 
     private func runHibernatorCommand(_ arguments: [String]) async -> String? {

@@ -63,4 +63,20 @@ enum TmuxHelpers {
             }
         }
     }
+
+    /// Rename a tmux session.
+    static func renameSession(currentName: String, newName: String) async -> Bool {
+        let result = await run(arguments: [
+            "rename-session", "-t", currentName, newName
+        ])
+        return result != nil
+    }
+
+    /// Kill/delete a tmux session.
+    static func killSession(named name: String) async -> Bool {
+        let result = await run(arguments: [
+            "kill-session", "-t", name
+        ])
+        return result != nil
+    }
 }

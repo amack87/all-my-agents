@@ -38,18 +38,21 @@ final class SessionMonitor {
     }
 
     private func poll() {
+        let meshURL = store.meshServerURL
+
         Task.detached(priority: .utility) { [weak self] in
             // Try mesh API first (multi-machine), fall back to local discovery
             let meshSkip = await MainActor.run { self?.meshSkipRemaining ?? 0 }
 
             if meshSkip <= 0 {
-                if let meshSessions = await MeshAPIClient.fetchMeshSessions() {
+                if let meshSessions = await MeshAPIClient.fetchMeshSessions(serverURL: meshURL) {
                     await MainActor.run { [weak self] in
                         guard let self else { return }
                         self.meshSkipRemaining = 0
                         self.meshEverSucceeded = true
                         self.store.updateSessions(meshSessions)
                         self.syncNotifications(sessions: meshSessions)
+                        self.store.syncSidebarOrder()
                     }
                     return
                 } else {
@@ -229,8 +232,9 @@ final class SessionMonitor {
             .components(separatedBy: "\n")
             .compactMap { line -> RawProcess? in
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                // Match any claude process on a real TTY (not "??")
-                guard trimmed.contains("/claude") || trimmed.contains(" claude ") else { return nil }
+                // Match any AI coding agent process on a real TTY (not "??")
+                let agentPatterns = ["/claude", " claude ", "opencode", " codex", "/codex", " cursor", "/cursor", " aider", "/aider", "copilot"]
+                guard agentPatterns.contains(where: { trimmed.contains($0) }) else { return nil }
                 guard !trimmed.contains("grep") else { return nil }
                 guard !trimmed.contains("--print") else { return nil }
 
@@ -362,46 +366,96 @@ final class SessionMonitor {
     }
 
     /// Identify what agent is running as a child of the given shell PID.
+    /// Walks the immediate child processes and checks command names + full argument lists.
     nonisolated private static func detectAgent(panePid: String) async -> String {
-        guard let output = await runProcess("/usr/bin/pgrep", arguments: ["-lP", panePid]) else {
-            return "shell"
-        }
+        // Walk process tree two levels deep from the shell PID
+        var checkedPids = Set<String>()
+        var pidsToCheck = [panePid]
 
-        for line in output.components(separatedBy: "\n") {
-            let parts = line.trimmingCharacters(in: .whitespaces)
-                .split(separator: " ", maxSplits: 1)
-            guard parts.count == 2 else { continue }
-            let childPid = String(parts[0])
-            let childName = String(parts[1])
+        while !pidsToCheck.isEmpty {
+            let currentPid = pidsToCheck.removeFirst()
+            guard !checkedPids.contains(currentPid) else { continue }
+            checkedPids.insert(currentPid)
+            guard checkedPids.count <= 10 else { break } // limit depth
 
-            if childName == "claude" { return "Claude Code" }
-            if childName == "cursor" { return "Cursor" }
-            if childName == "aider" { return "Aider" }
-            if childName == "copilot" { return "Copilot" }
-            if childName == "codex" { return "Codex" }
-
-            // Node-based agents: check full args
-            if childName == "node" {
-                if let args = await runProcess("/bin/ps", arguments: ["-o", "args=", "-p", childPid]) {
-                    let lower = args.lowercased()
-                    if lower.contains("codex") { return "Codex" }
-                    if lower.contains("claude") { return "Claude Code" }
-                    if lower.contains("cursor") { return "Cursor" }
-                    if lower.contains("aider") { return "Aider" }
-                }
+            guard let output = await runProcess("/usr/bin/pgrep", arguments: ["-lP", currentPid]) else {
+                continue
             }
 
-            // Claude Code version-string process name (e.g. "2.1.77")
-            if childName.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression) != nil {
-                if let comm = await runProcess("/bin/ps", arguments: ["-o", "comm=", "-p", childPid]) {
-                    if comm.trimmingCharacters(in: .whitespacesAndNewlines) == "claude" {
-                        return "Claude Code"
+            for line in output.components(separatedBy: "\n") {
+                let parts = line.trimmingCharacters(in: .whitespaces)
+                    .split(separator: " ", maxSplits: 1)
+                guard parts.count == 2 else { continue }
+                let childPid = String(parts[0])
+                let childName = String(parts[1])
+
+                // Direct command name matches
+                if childName == "claude" { return "Claude Code" }
+                if childName == "cursor" { return "Cursor" }
+                if childName == "aider" { return "Aider" }
+                if childName == "copilot" { return "Copilot" }
+                if childName == "codex" { return "Codex" }
+                if childName == "opencode" { return "OpenCode" }
+
+                // Node-based agents: check full args
+                if childName == "node" || childName == "nodejs" {
+                    if let args = await runProcess("/bin/ps", arguments: ["-o", "args=", "-p", childPid]) {
+                        let lower = args.lowercased()
+                        if lower.contains("opencode") { return "OpenCode" }
+                        if lower.contains("codex") { return "Codex" }
+                        if lower.contains("claude") { return "Claude Code" }
+                        if lower.contains("cursor") { return "Cursor" }
+                        if lower.contains("aider") { return "Aider" }
+                        if lower.contains("copilot") { return "Copilot" }
+                        if lower.contains("agentic") { return "Agentic" }
                     }
                 }
+
+                // Python-based agents
+                if childName == "python3" || childName == "python" {
+                    if let args = await runProcess("/bin/ps", arguments: ["-o", "args=", "-p", childPid]) {
+                        let lower = args.lowercased()
+                        if lower.contains("aider") { return "Aider" }
+                        if lower.contains("openai") { return "OpenAI CLI" }
+                    }
+                }
+
+                // Go-based agents
+                if childName == "claude-code" || childName == "claude-code.exe" { return "Claude Code" }
+                if childName == "github-copilot-cli" { return "Copilot" }
+
+                // Claude Code version-string process name (e.g. "2.1.77")
+                if childName.range(of: #"^\d+\.\d+\.\d+$"#, options: .regularExpression) != nil {
+                    if let comm = await runProcess("/bin/ps", arguments: ["-o", "comm=", "-p", childPid]) {
+                        if comm.trimmingCharacters(in: .whitespacesAndNewlines) == "claude" {
+                            return "Claude Code"
+                        }
+                    }
+                }
+
+                // Check child processes too (two-level walk)
+                pidsToCheck.append(childPid)
             }
+        }
+
+        // Fallback: scan pane content for known agent identifiers
+        guard let panePidInt = Int32(panePid) else {
+            return "shell"
+        }
+        let paneOutput = await runProcess("/bin/ps", arguments: ["-o", "args=", "-p", panePidInt.description])
+        if let output = paneOutput {
+            let lower = output.lowercased()
+            if lower.contains("opencode") { return "OpenCode" }
+            if lower.contains("claude") { return "Claude Code" }
+            if lower.contains("cursor") { return "Cursor" }
         }
 
         return "shell"
+    }
+
+    /// Get the TTY for a pane PID to help with agent identification.
+    nonisolated private static func getPaneTTY(panePid: Int32) async -> String? {
+        return await runProcess("/bin/ps", arguments: ["-o", "tty=", "-p", String(panePid)])
     }
 
     // MARK: - Pane State Detection
@@ -413,14 +467,19 @@ final class SessionMonitor {
     /// **Working indicators** (agent actively processing):
     /// - "esc to interrupt" in status bar — agent is mid-tool-call
     /// - "Computing..." / "Reading..." / etc. with elapsed time pattern
+    /// - Spinner characters (⣀⣀⣀) or Unicode ornaments (◌) in status bar
+    /// - Elapsed time counters: "0.5s" / "1.2s" with timing dots
+    /// - Token/timing counters: "57 tok/s", "1.2k tokens"
     /// - No command prompt (`❯` alone on a line) visible at all
     ///
     /// **Needs-input indicators** (awaiting user response):
     /// - "Esc to cancel" in status bar — tool approval dialog
+    /// - "ctrl-g to edit" — file edit approval dialog
     /// - Selection UI: `❯` prefixing a numbered option (e.g. `❯ 1. Yes`)
     /// - Numbered options (1. / 2. / 1) / 2)) in recent content
-    /// - Permission prompts: "Allow", "(Y/n)", "(y/N)"
+    /// - Permission prompts: "Allow", "(Y/n)", "(y/N)", "Do you want to"
     /// - Question ending with "?" in recent output
+    /// - "Type here to tell" — send-a-message prompt
     ///
     /// **Idle** (at command prompt, finished work):
     /// - `❯` prompt visible with none of the above signals
@@ -430,7 +489,7 @@ final class SessionMonitor {
         ]) else { return .unknown }
 
         let lines = output.components(separatedBy: "\n")
-        let tail = lines.suffix(20)
+        let tail = lines.suffix(25)
 
         // --- Pass 1: Check status bar / hint lines for strong signals ---
         for line in tail {
@@ -439,14 +498,25 @@ final class SessionMonitor {
             // "esc to interrupt" = agent is actively working on a tool call
             if lower.contains("esc to interrupt") { return .working }
 
-            // Progress indicator: "Computing...", "Reading...", etc. with elapsed time
-            if lower.contains("...") && lower.contains("token") { return .working }
+            // Progress indicator: "Computing...", "Reading...", etc.
+            if lower.contains("...") && (lower.contains("token") || lower.contains("comput") || lower.contains("read") || lower.contains("fetch") || lower.contains("search")) { return .working }
 
             // "Generating.." / "Generating..." = agent is streaming a response
             if lower.contains("generating") { return .working }
 
             // Status bar progress: "Auto · 55.5% · 2 files edited" (middle-dot + percentage)
             if lower.contains("·") && lower.contains("%") { return .working }
+
+            // Spinner/ornament characters in status bar — agent is actively processing
+            if lower.contains("⣀") || lower.contains("⣤") || lower.contains("⣶") || lower.contains("⣿") { return .working }
+            if lower.contains("◌") || lower.contains("◉") || lower.contains("○") { return .working }
+
+            // Elapsed time counters in status bar: "0.5s" or "57 tok/s"
+            if lower.range(of: #"\d+\.\d+s"#, options: .regularExpression) != nil { return .working }
+            if lower.contains("tok/s") || lower.contains("tok/") || lower.contains("tokens") { return .working }
+
+            // "Thinking..." or "Analyzing..." indicators
+            if lower.contains("thinking") || lower.contains("analyzing") || lower.contains("planning") { return .working }
         }
 
         for line in tail {
@@ -455,9 +525,19 @@ final class SessionMonitor {
             // "Esc to cancel" = tool approval dialog awaiting input
             if lower.contains("esc to cancel") { return .needsInput }
 
+            // "ctrl-g to edit" = file edit approval dialog
+            if lower.contains("ctrl-g to edit") || lower.contains("ctrl+g to edit") { return .needsInput }
+
             // Permission prompts
             if lower.contains("(y/n)") || lower.contains("(y/n)") { return .needsInput }
             if lower.contains("allow") && lower.contains("?") { return .needsInput }
+            if lower.contains("do you want to") && lower.contains("?") { return .needsInput }
+
+            // "Type here to tell" = send-message prompt
+            if lower.contains("type here to tell") || lower.contains("type your instruction") { return .needsInput }
+
+            // "Press Enter to" = confirmation prompt
+            if lower.contains("press enter to") && !lower.contains("press enter to interrupt") { return .needsInput }
         }
 
         // --- Pass 2: Check for command prompt and selection UI ---
@@ -542,6 +622,9 @@ final class SessionMonitor {
                     return .needsInput
                 }
             }
+
+            // checkmark/cross indicators in tool results: "✓", "✗", "✅", "❌"
+            if lower.contains("✓") || lower.contains("✗") { return .needsInput }
         }
 
         return .idle

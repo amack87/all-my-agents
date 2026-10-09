@@ -7,6 +7,7 @@ import Foundation
 final class WebSocketTerminalSession: NSObject {
     let machineHost: String  // e.g. "100.64.1.5:3456"
     let target: String       // tmux session name or pane ID
+    let serverURL: String    // web server base URL, e.g. "http://localhost:3456"
     private(set) var terminalView: TerminalView?
     private var wsTask: URLSessionWebSocketTask?
     private var urlSession: URLSession?
@@ -14,9 +15,10 @@ final class WebSocketTerminalSession: NSObject {
 
     var onDisconnected: (() -> Void)?
 
-    init(machineHost: String, target: String) {
+    init(machineHost: String, target: String, serverURL: String = "http://localhost:3456") {
         self.machineHost = machineHost
         self.target = target
+        self.serverURL = serverURL
     }
 
     /// Create the terminal view and connect via WebSocket.
@@ -30,10 +32,13 @@ final class WebSocketTerminalSession: NSObject {
 
         terminalView = view
 
-        // Connect WebSocket
+        // Connect WebSocket through the configured mesh server
         let encodedHost = machineHost.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? machineHost
         let encodedTarget = target.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? target
-        let wsURL = URL(string: "ws://localhost:3456/ws/proxy/\(encodedHost)/\(encodedTarget)")!
+        let wsBase = serverURL
+            .replacingOccurrences(of: "http://", with: "ws://")
+            .replacingOccurrences(of: "https://", with: "wss://")
+        let wsURL = URL(string: "\(wsBase)/ws/proxy/\(encodedHost)/\(encodedTarget)")!
 
         urlSession = URLSession(configuration: .default)
         wsTask = urlSession!.webSocketTask(with: wsURL)

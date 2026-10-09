@@ -108,6 +108,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let appMenu = NSMenu()
         appMenu.addItem(NSMenuItem(title: "About All My Agents", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: ""))
         appMenu.addItem(.separator())
+        let prefsItem = NSMenuItem(title: "Settings...", action: #selector(openSettings), keyEquivalent: ",")
+        prefsItem.target = self
+        appMenu.addItem(prefsItem)
+        appMenu.addItem(.separator())
         appMenu.addItem(NSMenuItem(title: "Quit All My Agents", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
 
         let appMenuItem = NSMenuItem()
@@ -157,5 +161,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func zoomReset() {
         NotificationStore.shared.resetZoom()
+    }
+
+    // MARK: - Settings
+
+    @objc private func openSettings() {
+        NotificationStore.shared.showSettings = true
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 }

@@ -1,18 +1,35 @@
 import SwiftUI
 
 /// Left sidebar showing all active Claude Code sessions with status indicators.
+/// Layout follows the persisted manual order: collapsible groups (reorderable
+/// via handle drag) in their stored sequence, then the ungrouped region,
+/// then a trailing drop zone that appends to the end.
 struct SessionSidebarView: View {
     var store: NotificationStore
     var onSelectSession: (ClaudeSession) -> Void
     var onReconnectSession: ((ClaudeSession) -> Void)? = nil
 
+    @State private var showRenameAlert = false
+    @State private var renameText = ""
+    @State private var sessionToRename: ClaudeSession? = nil
+    @State private var showKillAlert = false
+    @State private var sessionToKill: ClaudeSession? = nil
+    @State private var showGroupAlert = false
+    @State private var newGroupName = ""
+    @State private var sessionForGroup: ClaudeSession? = nil
+    @State private var showRenameGroupAlert = false
+    @State private var renameGroupText = ""
+    @State private var groupToRename: String? = nil
+    @State private var trailingTargeted = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             sidebarHeader
             Divider()
+            machineFilterBar
             sessionList
         }
-        .frame(width: 180)
+        .frame(width: 200)
         .background(.ultraThinMaterial)
         .sheet(isPresented: Binding(
             get: { store.showingAddSession },
@@ -20,6 +37,65 @@ struct SessionSidebarView: View {
         )) {
             AddSessionSheet(store: store, onSelectSession: onSelectSession)
         }
+        .alert("Rename Session", isPresented: $showRenameAlert, presenting: sessionToRename) { session in
+            TextField("New name", text: $renameText)
+            Button("Rename") {
+                renameSession(session, to: renameText)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Rename \"\(session.displayName)\" to:")
+        }
+        .alert("Kill Session", isPresented: $showKillAlert, presenting: sessionToKill) { session in
+            Button("Kill", role: .destructive) {
+                killSession(session)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Are you sure you want to kill tmux session \"\(session.displayName)\"? This will terminate the agent process.")
+        }
+        .alert("New Group", isPresented: $showGroupAlert) {
+            TextField("Group name", text: $newGroupName)
+            Button("Create") {
+                let name = newGroupName.trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty, let session = sessionForGroup {
+                    store.assignSession(session, toGroup: name)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Enter a name for the new session group:")
+        }
+        .alert("Rename Group", isPresented: $showRenameGroupAlert, presenting: groupToRename) { name in
+            TextField("Group name", text: $renameGroupText)
+            Button("Rename") {
+                store.renameGroup(name, to: renameGroupText)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { name in
+            Text("Rename group \"\(name)\" to:")
+        }
+    }
+
+    private var machineFilterBar: some View {
+        let machines = store.availableMachines
+        if machines.count <= 1 {
+            return AnyView(EmptyView())
+        }
+        return AnyView(
+            Picker("Machine", selection: Binding(
+                get: { store.machineFilter ?? "All Machines" },
+                set: { store.machineFilter = $0 == "All Machines" ? nil : $0 }
+            )) {
+                ForEach(machines, id: \.self) { m in
+                    Text(m).tag(m).font(.caption)
+                }
+            }
+            .pickerStyle(.menu)
+            .font(.caption)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        )
     }
 
     private var sidebarHeader: some View {
@@ -38,6 +114,13 @@ struct SessionSidebarView: View {
             }
             .buttonStyle(.borderless)
             .help("Add session")
+            Button(action: { store.showSettings = true }) {
+                Image(systemName: "gearshape")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Settings")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -49,25 +132,120 @@ struct SessionSidebarView: View {
                 if store.sortedSessions.isEmpty {
                     emptyState
                 } else {
-                    ForEach(store.sortedSessions) { session in
-                        SessionRowView(
-                            session: session,
-                            isActive: session.id == store.activeSessionID
-                        )
-                        .onTapGesture { onSelectSession(session) }
-                        .contextMenu {
-                            if session.terminalTarget != nil {
-                                Button("Open Terminal") { onSelectSession(session) }
-                                Button("Reconnect") {
-                                    onReconnectSession?(session)
-                                }
-                            }
-                            Divider()
-                            Button("Remove from Sidebar", role: .destructive) {
-                                store.hideSession(session)
+                    ForEach(store.sidebarGroups) { group in
+                        GroupHeaderRow(store: store, group: group) {
+                            groupToRename = group.name
+                            renameGroupText = group.name
+                            showRenameGroupAlert = true
+                        }
+                        if !group.isCollapsed {
+                            ForEach(group.sessions) { session in
+                                sessionTile(session, group: group.name)
                             }
                         }
                     }
+                    ForEach(store.ungroupedSessions) { session in
+                        sessionTile(session, group: nil)
+                    }
+                    trailingDropZone
+                }
+            }
+        }
+    }
+
+    private func sessionTile(_ session: ClaudeSession, group: String?) -> some View {
+        SidebarSessionTile(
+            store: store,
+            session: session,
+            isActive: session.id == store.activeSessionID,
+            group: group,
+            onSelect: { onSelectSession(session) }
+        )
+        .contextMenu { sessionContextMenu(session) }
+    }
+
+    /// Trailing gap: dropping here appends to the end of the ungrouped
+    /// region (sessions) or the end of the group list (groups).
+    private var trailingDropZone: some View {
+        Color.clear
+            .frame(maxWidth: .infinity)
+            .frame(height: 28)
+            .dropDestination(
+                for: SidebarDragItem.self,
+                action: { items, _ in
+                    guard let item = items.first else { return false }
+                    routeSidebarDrop(store, item: item, targetGroup: nil, anchor: nil, after: true)
+                    return true
+                },
+                isTargeted: { trailingTargeted = $0 }
+            )
+            .background(trailingTargeted ? Color.accentColor.opacity(0.1) : Color.clear)
+    }
+
+    @ViewBuilder
+    private func sessionContextMenu(_ session: ClaudeSession) -> some View {
+        if session.terminalTarget != nil {
+            Button("Open Terminal") { onSelectSession(session) }
+            Button("Reconnect") { onReconnectSession?(session) }
+        }
+        Divider()
+        if session.tmuxSession != nil {
+            Button("Rename Session") {
+                sessionToRename = session
+                renameText = session.displayName
+                showRenameAlert = true
+            }
+            Button("Kill Session", role: .destructive) {
+                sessionToKill = session
+                showKillAlert = true
+            }
+            Divider()
+        }
+        if !store.groupNames.isEmpty || session.tmuxSession != nil {
+            Menu("Assign to Group") {
+                ForEach(store.groupNames, id: \.self) { group in
+                    Button(group) {
+                        store.assignSession(session, toGroup: group)
+                    }
+                }
+                if store.groupName(for: session) != nil {
+                    Button("Remove from Group", role: .destructive) {
+                        store.assignSession(session, toGroup: nil)
+                    }
+                }
+                Divider()
+                Button("New Group...") {
+                    sessionForGroup = session
+                    newGroupName = ""
+                    showGroupAlert = true
+                }
+            }
+        }
+        Divider()
+        Button("Remove from Sidebar", role: .destructive) {
+            store.hideSession(session)
+        }
+    }
+
+    private func renameSession(_ session: ClaudeSession, to newName: String) {
+        guard let tmuxSession = session.tmuxSession, !newName.isEmpty else { return }
+        Task {
+            let success = await TmuxHelpers.renameSession(currentName: tmuxSession, newName: newName)
+            if success {
+                await MainActor.run {
+                    store.hideSession(session)
+                }
+            }
+        }
+    }
+
+    private func killSession(_ session: ClaudeSession) {
+        guard let name = session.tmuxSession else { return }
+        Task {
+            let success = await TmuxHelpers.killSession(named: name)
+            if success {
+                await MainActor.run {
+                    store.hideSession(session)
                 }
             }
         }
@@ -90,9 +268,18 @@ struct SessionSidebarView: View {
 struct SessionRowView: View {
     let session: ClaudeSession
     let isActive: Bool
+    /// When set, renders a drag handle that initiates sidebar reordering.
+    var dragItem: SidebarDragItem? = nil
 
     var body: some View {
         HStack(spacing: 8) {
+            if let dragItem {
+                Image(systemName: "line.3.horizontal")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .onTapGesture {}
+                    .draggable(dragItem)
+            }
             Circle()
                 .fill(statusColor)
                 .frame(width: 7, height: 7)

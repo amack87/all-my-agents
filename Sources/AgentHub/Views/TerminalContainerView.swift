@@ -9,6 +9,7 @@ import SwiftTerm
 struct TerminalContainerView: NSViewRepresentable {
     let target: String
     var machineHost: String? = nil
+    var meshServerURL: String = "http://localhost:3456"
     var zoomLevel: CGFloat = 1.0
     var onDetached: (() -> Void)? = nil
 
@@ -50,7 +51,7 @@ struct TerminalContainerView: NSViewRepresentable {
     }
 
     private func makeRemoteView(host: String, fontSize: CGFloat, context: Context) -> NSView {
-        let wsSession = WebSocketTerminalSession(machineHost: host, target: target)
+        let wsSession = WebSocketTerminalSession(machineHost: host, target: target, serverURL: meshServerURL)
         wsSession.onDisconnected = {
             DispatchQueue.main.async { onDetached?() }
         }

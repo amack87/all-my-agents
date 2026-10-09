@@ -33,4 +33,16 @@ enum SidebarPreferences {
         guard let data = try? JSONEncoder().encode(storage) else { return }
         fm.createFile(atPath: filePath, contents: data)
     }
+
+    // MARK: - Mesh Server URL
+
+    private static let meshServerURLKey = "allmyagents-mesh-server"
+
+    static func loadMeshServerURL() -> String {
+        UserDefaults.standard.string(forKey: meshServerURLKey) ?? "http://localhost:3456"
+    }
+
+    static func saveMeshServerURL(_ url: String) {
+        UserDefaults.standard.set(url, forKey: meshServerURLKey)
+    }
 }

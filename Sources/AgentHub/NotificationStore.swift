@@ -23,9 +23,256 @@ final class NotificationStore {
     /// Whether the "Add Session" sheet is presented.
     var showingAddSession: Bool = false
 
+    /// Whether the Settings sheet is presented.
+    var showSettings: Bool = false
+
     /// Tmux session name that was just created/selected via AddSessionSheet,
     /// pending resolution to a real session ID once the monitor discovers it.
     private(set) var pendingSessionName: String? = nil
+
+    // Session rename/kill state
+    var showRenameAlert: Bool = false
+    var renameTarget: ClaudeSession? = nil
+    var renameText: String = ""
+    var showKillConfirmation: Bool = false
+    var killTarget: ClaudeSession? = nil
+
+    // Mesh server URL (configurable remote web server for multi-machine discovery)
+    var meshServerURL: String = "http://localhost:3456" {
+        didSet {
+            SidebarPreferences.saveMeshServerURL(meshServerURL)
+        }
+    }
+
+    // Machine filter
+    var machineFilter: String? = nil {
+        didSet { refreshSidebarOrder() }
+    }
+    var availableMachines: [String] {
+        let machines = Set(sessions.compactMap(\.machine))
+        return ["All Machines"] + machines.sorted()
+    }
+
+    /// Known mesh server options derived from discovered sessions.
+    /// Always includes "This Machine" (localhost). Remote machines are
+    /// labeled by their display name with the host URL.
+    var meshServerOptions: [(label: String, url: String)] {
+        var seen = Set<String>()
+        var options = [(label: String, url: String)]()
+        options.append(("This Machine (localhost:3456)", "http://localhost:3456"))
+        seen.insert("http://localhost:3456")
+        for session in sessions {
+            guard let host = session.machineHost, host != "local" else { continue }
+            let url = "http://\(host)"
+            guard seen.insert(url).inserted else { continue }
+            let label = session.machine ?? host
+            options.append(("\(label) (\(host))", url))
+        }
+        return options
+    }
+
+    // Sidebar manual order (groups + ungrouped region).
+    // Sole ordering authority — status never reflows tiles.
+    private(set) var sidebarOrder: SidebarOrderData = SidebarOrder.load()
+    private(set) var sidebarGroups: [ResolvedSidebarGroup] = []
+    private(set) var ungroupedSessions: [ClaudeSession] = []
+
+    /// Non-empty group names in persisted order (menu options).
+    var groupNames: [String] {
+        sidebarOrder.order.filter { (sidebarOrder.groups[$0] ?? []).count > 0 }
+    }
+
+    func groupName(for session: ClaudeSession) -> String? {
+        let key = session.sidebarKey
+        return sidebarOrder.order.first { name in
+            (sidebarOrder.groups[name] ?? []).contains(key)
+        }
+    }
+
+    /// Assign (non-nil) or remove (nil) a session's group membership.
+    /// Adding appends to the end of the group, creating it if needed;
+    /// removing returns the tile to the bottom of the ungrouped region.
+    func assignSession(_ session: ClaudeSession, toGroup group: String?) {
+        if let group, !group.isEmpty {
+            moveSession(session.sidebarKey, toGroup: group, relativeTo: nil, after: false)
+        } else {
+            removeFromGroup(session.sidebarKey)
+        }
+    }
+
+    private func removeFromGroup(_ key: String) {
+        var next = sidebarOrder
+        for name in Array(next.groups.keys) {
+            next.groups[name] = (next.groups[name] ?? []).filter { $0 != key }
+        }
+        if !next.ungroupedOrder.contains(key) {
+            next.ungroupedOrder.append(key)
+        }
+        commitOrder(next)
+    }
+
+    /// Move a session relative to a neighbor in the target list.
+    /// `target` nil = ungrouped region; neighbor nil = append to the end.
+    /// The index is computed against the persisted (post-removal) list, so
+    /// stale keys interleaved in the data can't skew the drop position.
+    func moveSession(
+        _ key: String,
+        toGroup target: String?,
+        relativeTo neighbor: String?,
+        after: Bool
+    ) {
+        let list = target.flatMap { sidebarOrder.groups[$0] } ?? sidebarOrder.ungroupedOrder
+        let keyIdx = list.firstIndex(of: key)
+        let index: Int
+        if let neighbor, neighbor != key, let nIdx = list.firstIndex(of: neighbor) {
+            let beforeKey = keyIdx.map { $0 < nIdx } ?? false
+            index = nIdx - (beforeKey ? 1 : 0) + (after ? 1 : 0)
+        } else if neighbor == nil {
+            index = list.count - (keyIdx != nil ? 1 : 0)
+        } else {
+            // Self-drop or missing neighbor: stay put (no-op).
+            index = keyIdx ?? list.count
+        }
+        commitOrder(SidebarOrder.moveSession(sidebarOrder, key: key, target: target, index: index))
+    }
+
+    /// Reorder a group. `index` is the rendered group index; downward moves
+    /// shift by one because moveGroup removes the name before inserting.
+    func moveGroup(_ name: String, to index: Int) {
+        var at = index
+        if let src = sidebarOrder.order.firstIndex(of: name), src < at {
+            at -= 1
+        }
+        commitOrder(SidebarOrder.moveGroup(sidebarOrder, name: name, index: at))
+    }
+
+    func renameGroup(_ old: String, to new: String) {
+        let trimmed = new.trimmingCharacters(in: .whitespaces)
+        guard old != trimmed, !trimmed.isEmpty, !sidebarOrder.order.contains(trimmed) else {
+            return
+        }
+        var next = sidebarOrder
+        next.groups[trimmed] = next.groups[old] ?? []
+        next.collapsed[trimmed] = next.collapsed[old] ?? false
+        next.groups[old] = nil
+        next.collapsed[old] = nil
+        next.order = next.order.map { $0 == old ? trimmed : $0 }
+        commitOrder(next)
+    }
+
+    /// Delete a group. Its members' keys vanish, so resolve re-seeds them
+    /// at the top of the ungrouped region (web deleteGroup behavior).
+    func deleteGroup(_ name: String) {
+        var next = sidebarOrder
+        next.groups[name] = nil
+        next.collapsed[name] = nil
+        next.order = next.order.filter { $0 != name }
+        commitOrder(next)
+    }
+
+    /// Empty a group without deleting it: members go to the bottom of the
+    /// ungrouped region and the empty header stays (droppable target).
+    func ungroupAll(_ name: String) {
+        var next = sidebarOrder
+        let members = next.groups[name] ?? []
+        next.groups[name] = []
+        for key in members where !next.ungroupedOrder.contains(key) {
+            next.ungroupedOrder.append(key)
+        }
+        commitOrder(next)
+    }
+
+    func toggleGroupCollapsed(_ name: String) {
+        var next = sidebarOrder
+        next.collapsed[name] = !(next.collapsed[name] ?? false)
+        commitOrder(next)
+    }
+
+    private func commitOrder(_ next: SidebarOrderData) {
+        sidebarOrder = next
+        SidebarOrder.save(next)
+        refreshSidebarOrder()
+        scheduleSidebarPush()
+    }
+
+    /// Re-resolve render state against the visible sessions and persist
+    /// any reconciliation changes (key rewrites, fresh seeds, appended groups).
+    @discardableResult
+    private func refreshSidebarOrder() -> Bool {
+        let visible = sessions.filter { session in
+            if hiddenSessionNames.contains(session.sidebarName) { return false }
+            if let filter = machineFilter, filter != "All Machines" {
+                return session.machine == filter
+            }
+            return true
+        }
+        let result = SidebarOrder.resolve(data: sidebarOrder, sessions: visible)
+        sidebarOrder = result.data
+        if result.changed {
+            SidebarOrder.save(result.data)
+        }
+        sidebarGroups = result.groups
+        ungroupedSessions = result.ungrouped
+        return result.changed
+    }
+
+    // MARK: - Sidebar group sync (local-first)
+    //
+    // The local copy stays authoritative; the server copy is just a meeting
+    // point so the web app and this app converge. Every path here is
+    // best-effort — if the server is down, nothing blocks and nothing changes.
+
+    private var sidebarPushTask: Task<Void, Never>?
+    private var sidebarSyncedFromServer = false
+
+    /// Debounced push so a burst of local edits reaches the server once,
+    /// without blocking the UI or hammering it during drags.
+    private func scheduleSidebarPush() {
+        sidebarPushTask?.cancel()
+        sidebarPushTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            await self?.pushSidebarOrder()
+        }
+    }
+
+    /// Pull the server's copy once per launch and merge it (last-writer-wins),
+    /// pushing the local copy when it is the newer one. Called when the mesh
+    /// server first responds; a no-op if it never does.
+    func syncSidebarOrder() {
+        guard !sidebarSyncedFromServer else { return }
+        sidebarSyncedFromServer = true
+        let url = meshServerURL
+        Task { [weak self] in
+            guard let remote = await MeshAPIClient.fetchSidebarGroups(serverURL: url) else { return }
+            await self?.mergeSidebarOrder(remote)
+        }
+    }
+
+    private func pushSidebarOrder() async {
+        let entry = SidebarOrder.entry()
+        guard let winner = await MeshAPIClient.pushSidebarGroups(entry, serverURL: meshServerURL)
+        else { return }
+        applySidebarOrderIfNewer(winner)
+    }
+
+    private func mergeSidebarOrder(_ remote: SidebarOrderEntry) async {
+        if SidebarOrder.remoteWins(local: SidebarOrder.entry(), remote: remote) {
+            applySidebarOrderIfNewer(remote)
+        } else if SidebarOrder.entryTimestamp(SidebarOrder.entry()) > 0 {
+            await pushSidebarOrder()
+        }
+    }
+
+    /// Adopt `remote` only when it is strictly newer than the local copy.
+    private func applySidebarOrderIfNewer(_ remote: SidebarOrderEntry) {
+        guard SidebarOrder.remoteWins(local: SidebarOrder.entry(), remote: remote) else { return }
+        SidebarOrder.save(remote.data, updatedAt: remote.updatedAt)
+        sidebarOrder = remote.data
+        if refreshSidebarOrder() {
+            scheduleSidebarPush()
+        }
+    }
 
     // MARK: - Zoom
 
@@ -65,7 +312,10 @@ final class NotificationStore {
     }
 
     static let shared = NotificationStore()
-    private init() {}
+    private init() {
+        meshServerURL = SidebarPreferences.loadMeshServerURL()
+        refreshSidebarOrder()
+    }
 
     // MARK: - Computed
 
@@ -210,17 +460,10 @@ final class NotificationStore {
 
     // MARK: - Sessions
 
-    /// Visible sessions (excluding user-hidden ones), sorted by priority.
+    /// Visible sessions in manual sidebar order (the sole ordering
+    /// authority — status only drives the dot/label, never position).
     var sortedSessions: [ClaudeSession] {
-        let visible = sessions.filter { session in
-            let name = session.tmuxSession ?? session.displayName
-            return !hiddenSessionNames.contains(name)
-        }
-        let active = visible.filter { $0.id == activeSessionID }
-        let needsInput = visible.filter { $0.id != activeSessionID && $0.status == .needsInput }
-        let working = visible.filter { $0.id != activeSessionID && $0.status == .working }
-        let rest = visible.filter { $0.id != activeSessionID && ($0.status == .idle || $0.status == .unknown) }
-        return active + needsInput + working + rest
+        sidebarGroups.flatMap(\.sessions) + ungroupedSessions
     }
 
     /// Sessions the user has hidden from the sidebar (available but not tracked).
@@ -247,6 +490,8 @@ final class NotificationStore {
         if let active = activeSessionID, !newSessions.contains(where: { $0.id == active }) {
             activeSessionID = nil
         }
+
+        refreshSidebarOrder()
     }
 
     /// Mark a tmux session name as pending selection — the next monitor
@@ -266,6 +511,7 @@ final class NotificationStore {
         if activeSessionID == session.id {
             activeSessionID = nil
         }
+        refreshSidebarOrder()
     }
 
     /// Unhide a session name so it appears in the sidebar again.
@@ -273,6 +519,7 @@ final class NotificationStore {
         let updated = hiddenSessionNames.subtracting([name])
         hiddenSessionNames = updated
         SidebarPreferences.save(hiddenSessionNames: updated)
+        refreshSidebarOrder()
     }
 
     func selectSession(_ id: String) {

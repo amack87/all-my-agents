@@ -5,6 +5,10 @@ struct FloatingPanelRootView: View {
     var store: NotificationStore
     @State private var activeTerminal: TerminalTarget? = nil
     @State private var showingSpeedrun: Bool = false
+    @State private var showKillAlert = false
+    @State private var showRenameAlert = false
+    @State private var renameText = ""
+    @State private var showSettings = false
 
     struct TerminalTarget: Equatable {
         let target: String
@@ -23,6 +27,11 @@ struct FloatingPanelRootView: View {
         return .list
     }
 
+    private var currentSession: ClaudeSession? {
+        guard let t = activeTerminal else { return nil }
+        return store.sessions.first(where: { $0.terminalTarget == t.target })
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             if store.sidebarVisible {
@@ -36,11 +45,29 @@ struct FloatingPanelRootView: View {
             mainContent
         }
         .frame(minWidth: store.sidebarVisible ? 560 : 380, minHeight: 300)
-        // Hidden button for Cmd+\ sidebar toggle
         .background {
             Button("") { store.toggleSidebar() }
                 .keyboardShortcut("\\", modifiers: .command)
                 .hidden()
+        }
+        .alert("Kill Session", isPresented: $showKillAlert, presenting: currentSession) { session in
+            Button("Kill", role: .destructive) { killSession(session) }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Kill tmux session \"\(session.displayName)\"? This terminates the agent.")
+        }
+        .alert("Rename Session", isPresented: $showRenameAlert, presenting: currentSession) { session in
+            TextField("New name", text: $renameText)
+            Button("Rename") { renameSession(session) }
+            Button("Cancel", role: .cancel) {}
+        } message: { session in
+            Text("Rename \"\(session.displayName)\" to:")
+        }
+        .sheet(isPresented: Binding(
+            get: { store.showSettings },
+            set: { store.showSettings = $0 }
+        )) {
+            SettingsView(store: store)
         }
     }
 
@@ -80,22 +107,51 @@ struct FloatingPanelRootView: View {
 
     private func terminalMode(target: String, machineHost: String?) -> some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 6) {
                 Button(action: { activeTerminal = nil }) {
                     Label("Back", systemImage: "chevron.left")
                 }
-                .buttonStyle(.borderless)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
                 Spacer()
+
                 Text(sessionName(for: target))
                     .font(.callout.bold())
                     .foregroundStyle(.primary)
+
                 Spacer()
+
+                ControlGroup {
+                    if currentSession?.tmuxSession != nil {
+                        Button(action: { reconnect(host: machineHost, target: target) }) {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .help("Reconnect")
+
+                        Button(action: {
+                            renameText = currentSession?.displayName ?? ""
+                            showRenameAlert = true
+                        }) {
+                            Image(systemName: "pencil")
+                        }
+                        .help("Rename Session")
+
+                        Button(action: { showKillAlert = true }) {
+                            Image(systemName: "xmark.square")
+                                .foregroundStyle(.red)
+                        }
+                        .help("Kill Session")
+                    }
+                }
+                .controlSize(.small)
+
                 Button(action: startSpeedrun) {
                     Label("Speedrun", systemImage: "bolt.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .controlSize(.small)
                 .tint(store.waitingCount > 0 ? .orange : .blue)
-                .font(.caption)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -103,9 +159,30 @@ struct FloatingPanelRootView: View {
             TerminalContainerView(
                 target: target,
                 machineHost: machineHost,
-                zoomLevel: store.zoomLevel
+                meshServerURL: store.meshServerURL,
+                zoomLevel: store.zoomLevel,
+                onDetached: { activeTerminal = nil }
             )
             .id("\(machineHost ?? "local"):\(target)")
+        }
+    }
+
+    private func renameSession(_ session: ClaudeSession) {
+        guard let tmuxSession = session.tmuxSession, !renameText.isEmpty else { return }
+        Task {
+            _ = await TmuxHelpers.renameSession(currentName: tmuxSession, newName: renameText)
+            await MainActor.run { store.hideSession(session) }
+        }
+    }
+
+    private func killSession(_ session: ClaudeSession) {
+        guard let name = session.tmuxSession else { return }
+        Task {
+            _ = await TmuxHelpers.killSession(named: name)
+            await MainActor.run {
+                store.hideSession(session)
+                activeTerminal = nil
+            }
         }
     }
 
@@ -125,6 +202,13 @@ struct FloatingPanelRootView: View {
         store.selectSession(session.id)
         if let target = session.terminalTarget {
             activeTerminal = TerminalTarget(target: target, machineHost: session.machineHost)
+        }
+    }
+
+    private func reconnect(host: String?, target: String) {
+        activeTerminal = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            activeTerminal = TerminalTarget(target: target, machineHost: host)
         }
     }
 
