@@ -1,0 +1,2614 @@
+// --- xterm imports via CDN ---
+import { Terminal } from "https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm";
+import { FitAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm";
+import { WebLinksAddon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/+esm";
+import { Unicode11Addon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/+esm";
+
+// --- Sidebar ordering (pure, DOM-free) ---
+import { moveSession, moveGroup, resolveOrder } from "./session-order.js";
+import { pickWinner, isSafeGroupName, sanitizeSidebarOrder } from "./sidebar-sync.js";
+import { resizeFrame, claimFrame, CLAIM_HEARTBEAT_MS, shouldHeartbeat, isTouched } from "./terminal-size.js";
+import { esc } from "./escape.js";
+
+// --- Theme Helpers ---
+function getTerminalTheme() {
+  const isLight = window.matchMedia("(prefers-color-scheme: light)").matches;
+  return isLight
+    ? { background: "#1a1a1a", foreground: "#e4e4e4", cursor: "#e4e4e4", selectionBackground: "rgba(79, 70, 229, 0.3)" }
+    : { background: "#000000", foreground: "#e4e4e4", cursor: "#e4e4e4", selectionBackground: "rgba(99, 102, 241, 0.3)" };
+}
+
+// --- Host Discovery & Failover ---
+// On load, probes the current host + all known peers to find which servers
+// are online. If the current host goes down, auto-switches to another.
+const HOSTS_STORAGE_KEY = "allmyagents-known-hosts";
+const ACTIVE_HOST_KEY = "allmyagents-active-host";
+const APP_STORAGE_KEYS = [
+  HOSTS_STORAGE_KEY,
+  ACTIVE_HOST_KEY,
+  "allmyagents-zoom",
+  "allmyagents-sidebar-width",
+  // The sidebar groups are deliberately NOT reset. They are the user's
+  // organisation, not app state, and they sync to every other surface — so
+  // wiping them here erased the groups everywhere, not just on this device.
+];
+
+// Base URL for all API calls. Empty string = same origin (default).
+let apiBase = "";
+
+function apiUrl(path) {
+  return apiBase + path;
+}
+
+function wsBase() {
+  if (!apiBase) return `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+  const url = new URL(apiBase);
+  return `${url.protocol === "https:" ? "wss:" : "ws:"}//${url.host}`;
+}
+
+function removeStoredValue(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch { /* ignore */ }
+}
+
+function getStoredJson(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    removeStoredValue(key);
+    return fallback;
+  }
+}
+
+function getStoredString(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    removeStoredValue(key);
+    return null;
+  }
+}
+
+function setStoredValue(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch { /* ignore */ }
+}
+
+const RESUME_AFTER_RESET_KEY = "allmyagents-resume-after-reset";
+
+function resetAppState() {
+  if (!window.confirm(
+    "Reset app data on this device?\n\n" +
+    "Clears the cached host list, the zoom level and the sidebar width.\n" +
+    "Your session groups are kept.",
+  )) return;
+  // Remember active session so we can reopen it after reset
+  if (state.activeSession) {
+    try {
+      sessionStorage.setItem(RESUME_AFTER_RESET_KEY, JSON.stringify({
+        name: state.activeSession,
+        machineHost: state.activeSessionMeta?.machineHost || "local",
+      }));
+    } catch { /* ignore */ }
+  }
+  for (const key of APP_STORAGE_KEYS) removeStoredValue(key);
+  apiBase = "";
+  // Async reset without full page reload
+  state.activeSession = null;
+  state.activeSessionMeta = null;
+  state.sessions = [];
+  closeTerminal();
+  loadSessions().then(() => {
+    consumeResumeAfterReset();
+  });
+}
+
+function consumeResumeAfterReset() {
+  let target = null;
+  try {
+    const raw = sessionStorage.getItem(RESUME_AFTER_RESET_KEY);
+    sessionStorage.removeItem(RESUME_AFTER_RESET_KEY);
+    if (raw) target = JSON.parse(raw);
+  } catch { /* ignore */ }
+  if (!target?.name) return;
+  const match = state.sessions.find((s) =>
+    s.name === target.name && (s.machineHost || "local") === (target.machineHost || "local")
+  );
+  if (match) openTerminal(match.name, match.machineHost);
+}
+
+
+/** Probe a host's /api/identity with a timeout. Returns identity or null. */
+async function probeHost(origin, timeoutMs = 2000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${origin}/api/identity`, { signal: controller.signal });
+    if (!res.ok) return null;
+    const identity = await res.json();
+    return { origin, name: identity.name, peers: identity.peers || [] };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Load known hosts from localStorage. Always includes current origin. */
+function loadKnownHosts() {
+  const saved = getStoredJson(HOSTS_STORAGE_KEY, []);
+  const hosts = Array.isArray(saved) ? saved.filter((h) => typeof h === "string" && h) : [];
+  const current = `${location.protocol}//${location.host}`;
+  if (!hosts.includes(current)) hosts.unshift(current);
+  return [...new Set(hosts)];
+}
+
+/** Save known hosts to localStorage. */
+function saveKnownHosts(hosts) {
+  setStoredValue(HOSTS_STORAGE_KEY, JSON.stringify([...new Set(hosts)]));
+}
+
+/**
+ * Discover the best available host. Probes all known hosts in parallel,
+ * picks the first to respond (preferring the last-used host), and
+ * updates the known hosts list with any newly discovered peers.
+ */
+async function discoverActiveHost() {
+  const known = loadKnownHosts();
+  const lastActive = getStoredString(ACTIVE_HOST_KEY);
+
+  // Probe all known hosts in parallel
+  const results = await Promise.allSettled(known.map((h) => probeHost(h)));
+  const alive = results
+    .map((r, i) => (r.status === "fulfilled" && r.value ? { ...r.value, idx: i } : null))
+    .filter(Boolean);
+
+  if (alive.length === 0) {
+    // No hosts reachable — stay on current origin, clear stale active host
+    apiBase = "";
+    removeStoredValue(ACTIVE_HOST_KEY);
+    return;
+  }
+
+  // Prefer last-used host if still alive, otherwise first responder
+  const preferred = alive.find((h) => h.origin === lastActive) || alive[0];
+  const current = `${location.protocol}//${location.host}`;
+
+  if (preferred.origin === current) {
+    apiBase = ""; // same origin, use relative URLs
+  } else {
+    apiBase = preferred.origin;
+  }
+  setStoredValue(ACTIVE_HOST_KEY, preferred.origin);
+
+  // Rebuild host list from ONLY alive hosts + their reported peers (prune dead hosts)
+  const aliveOrigins = new Set(alive.map((h) => h.origin));
+  aliveOrigins.add(current); // always keep current origin
+  for (const host of alive) {
+    for (const peer of host.peers) {
+      aliveOrigins.add(`http://${peer.host}:${peer.port || 3456}`);
+    }
+  }
+  saveKnownHosts([...aliveOrigins]);
+
+  return preferred;
+}
+
+/** Check if the active host is still reachable. If not, failover. */
+async function healthCheck() {
+  const testUrl = apiUrl("/api/identity");
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(testUrl, { signal: controller.signal });
+    clearTimeout(timer);
+    if (res.ok) return true;
+  } catch { /* unreachable */ }
+
+  // Active host is down — rediscover
+  console.log("[AllMyAgents] Active host unreachable, failing over...");
+  await discoverActiveHost();
+  await loadSessions();
+  return false;
+}
+
+// --- State ---
+const state = {
+  sessions: [],
+  activeSession: null,
+  activeSessionMeta: null, // { machine, machineHost }
+  ws: null,
+  terminal: null,
+  fitAddon: null,
+  pollInterval: null,
+  // Mesh
+  identity: null,
+  peerStatus: {},
+  machineFilter: "all",
+  hasPeers: false,
+  // Resilience
+  sessionsLoadInFlight: false,
+  sessionsLoadQueued: false,
+  sessionsLastSuccessAt: 0,
+  sessionLoadFailures: 0,
+  terminalPollFailures: 0,
+  terminalLastReconnectAt: 0,
+  terminalReconnectTimer: null,
+  terminalReconnectAttempts: 0,
+  renderedSessionsSignature: "",
+  inCopyMode: false,
+  // Terminal size: the grid the browser last told the server about, and
+  // whether the grid may have gone stale while the page was not looked at.
+  terminalSize: null,
+  terminalSizeStale: false,
+  claimTimer: null,
+  lastTouchClaimAt: 0,
+  lastInputAt: 0,
+};
+
+// --- Session Groups (localStorage-backed, synced via the server) ---
+const GROUPS_STORAGE_KEY = "allmyagents-session-groups";
+const GROUPS_UPDATED_AT_KEY = "allmyagents-session-groups-updated-at";
+
+function loadGroups() {
+  const fallback = { groups: {}, collapsed: {}, order: [], ungroupedOrder: [] };
+  const data = getStoredJson(GROUPS_STORAGE_KEY, fallback);
+  if (!data || typeof data !== "object") return fallback;
+  // The same normaliser the server runs on what it receives, so both sides
+  // agree on what a group is — including which names are not group names.
+  return sanitizeSidebarOrder(data);
+}
+
+// Write the local copy without re-stamping it. Used when adopting the server's
+// copy, which must not look like a fresh local edit or get pushed straight back.
+function persistGroupsLocal(data, updatedAt) {
+  setStoredValue(GROUPS_STORAGE_KEY, JSON.stringify(data));
+  if (Number.isFinite(updatedAt)) setStoredValue(GROUPS_UPDATED_AT_KEY, String(updatedAt));
+}
+
+function loadGroupsEntry() {
+  const stored = Number(getStoredString(GROUPS_UPDATED_AT_KEY));
+  return { data: loadGroups(), updatedAt: Number.isFinite(stored) ? stored : 0 };
+}
+
+function saveGroups(data) {
+  persistGroupsLocal(data, Date.now());
+  scheduleGroupsPush();
+}
+
+function getGroups() {
+  return loadGroups();
+}
+
+function createGroup(name) {
+  if (!isSafeGroupName(name)) return;
+  const data = loadGroups();
+  if (!data.groups[name]) {
+    data.groups[name] = [];
+    data.order = [...data.order.filter((n) => n !== name), name];
+  }
+  // The user has groups again, so any earlier "I cleared them" no longer holds.
+  delete data.groupsCleared;
+  saveGroups(data);
+}
+
+function deleteGroup(name) {
+  const data = loadGroups();
+  delete data.groups[name];
+  delete data.collapsed[name];
+  data.order = data.order.filter((n) => n !== name);
+  // Deleting the last group is the only way the user can mean "no groups".
+  // The flag lets that intent survive the sync instead of being undone by a
+  // copy that still holds the old group.
+  if (Object.keys(data.groups).length === 0) data.groupsCleared = true;
+  saveGroups(data);
+}
+
+function renameGroup(oldName, newName) {
+  if (oldName === newName) return;
+  const data = loadGroups();
+  data.groups[newName] = data.groups[oldName] || [];
+  data.collapsed[newName] = data.collapsed[oldName] || false;
+  delete data.groups[oldName];
+  delete data.collapsed[oldName];
+  data.order = data.order.map((n) => (n === oldName ? newName : n));
+  saveGroups(data);
+}
+
+function addToGroup(groupName, sKey) {
+  // A name that cannot be stored as an object key is not a group; the session
+  // lands in the ungrouped region instead of vanishing.
+  if (!isSafeGroupName(groupName)) {
+    const data = loadGroups();
+    data.ungroupedOrder = (data.ungroupedOrder || []).filter((k) => k !== sKey);
+    saveGroups(data);
+    return;
+  }
+  const data = loadGroups();
+  // Remove from any existing group first
+  for (const [gn, members] of Object.entries(data.groups)) {
+    data.groups[gn] = members.filter((k) => k !== sKey);
+  }
+  data.ungroupedOrder = (data.ungroupedOrder || []).filter((k) => k !== sKey);
+  if (!data.groups[groupName]) {
+    data.groups[groupName] = [];
+    data.order = [...data.order.filter((n) => n !== groupName), groupName];
+  }
+  data.groups[groupName] = [...data.groups[groupName], sKey];
+  saveGroups(data);
+}
+
+function removeFromGroup(sKey) {
+  const data = loadGroups();
+  for (const [gn, members] of Object.entries(data.groups)) {
+    data.groups[gn] = members.filter((k) => k !== sKey);
+  }
+  // Return the tile to the ungrouped region (bottom) rather than dropping it.
+  if (!(data.ungroupedOrder || []).includes(sKey)) {
+    data.ungroupedOrder = [...(data.ungroupedOrder || []), sKey];
+  }
+  saveGroups(data);
+}
+
+// Move every member to the bottom of the ungrouped region, keeping the
+// (now empty) group so its header stays droppable.
+function ungroupAll(groupName) {
+  const data = loadGroups();
+  const members = data.groups[groupName] || [];
+  data.groups[groupName] = [];
+  const existing = new Set(data.ungroupedOrder || []);
+  data.ungroupedOrder = [...(data.ungroupedOrder || []), ...members.filter((k) => !existing.has(k))];
+  saveGroups(data);
+}
+
+function toggleGroupCollapsed(groupName) {
+  const data = loadGroups();
+  data.collapsed[groupName] = !data.collapsed[groupName];
+  saveGroups(data);
+}
+
+function getSessionGroup(sKey) {
+  const data = loadGroups();
+  for (const [gn, members] of Object.entries(data.groups)) {
+    if (members.includes(sKey)) return gn;
+  }
+  return null;
+}
+
+// --- Sidebar group sync (local-first) ---
+// The local copy stays authoritative for this browser; the server copy lets the
+// macOS app (and other browsers) converge. Writes always land locally first and
+// pushes are best-effort, so the UI never blocks on the server.
+let groupsPushTimer = null;
+
+function scheduleGroupsPush() {
+  if (groupsPushTimer) clearTimeout(groupsPushTimer);
+  groupsPushTimer = setTimeout(() => {
+    groupsPushTimer = null;
+    pushGroupsEntry(loadGroupsEntry());
+  }, 800);
+}
+
+async function pushGroupsEntry(entry) {
+  try {
+    applyGroupsWinner(await api.postSidebarGroups(entry));
+  } catch { /* offline: the local copy stands */ }
+}
+
+function applyGroupsWinner(winner) {
+  if (!winner || !winner.data) return;
+  if (pickWinner(loadGroupsEntry(), winner) !== "remote") return;
+  persistGroupsLocal(winner.data, winner.updatedAt);
+  state.renderedSessionsSignature = "";
+  renderSessions();
+}
+
+async function syncGroups() {
+  let remote;
+  try {
+    remote = await api.getSidebarGroups();
+  } catch {
+    return; // offline: keep using the local copy
+  }
+  const winner = pickWinner(loadGroupsEntry(), remote);
+  if (winner === "remote") applyGroupsWinner(remote);
+  else if (winner === "local") pushGroupsEntry(loadGroupsEntry());
+}
+
+// --- API ---
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchJson(url, options = {}, { timeoutMs = 5000, retries = 0 } = {}) {
+  let attempt = 0;
+  for (;;) {
+    try {
+      const res = await fetchWithTimeout(url, options, timeoutMs);
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (!ct.includes("application/json") && !ct.includes("text/json")) {
+        const text = await res.text().catch(() => "");
+        throw new Error(
+          `Server returned ${res.status} ${res.statusText} (${ct || "no content-type"})` +
+          (text ? `: ${text.slice(0, 200)}` : "")
+        );
+      }
+      return await res.json();
+    } catch (err) {
+      if (attempt >= retries) throw err;
+      attempt++;
+      await sleep(200 * attempt);
+    }
+  }
+}
+
+const api = {
+  async getSessions() {
+    return fetchJson(apiUrl("/api/sessions"), {}, { timeoutMs: 5000, retries: 1 });
+  },
+  async createSession(name, opts = {}) {
+    return fetchJson(apiUrl("/api/sessions"), {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ name, ...opts }),
+    }, { timeoutMs: 7000 });
+  },
+  async getTargets() {
+    return fetchJson(apiUrl("/api/targets"), {}, { timeoutMs: 5000, retries: 1 });
+  },
+  async deleteSession(name, machineHost) {
+    const url = machineHost && machineHost !== "local"
+      ? apiUrl(`/api/proxy/${encodeURIComponent(machineHost)}/sessions/${encodeURIComponent(name)}`)
+      : apiUrl(`/api/sessions/${encodeURIComponent(name)}`);
+    return fetchJson(url, { method: "DELETE" }, { timeoutMs: 7000 });
+  },
+  async renameSession(name, newName, machineHost) {
+    const url = machineHost && machineHost !== "local"
+      ? apiUrl(`/api/proxy/${encodeURIComponent(machineHost)}/sessions/${encodeURIComponent(name)}/rename`)
+      : apiUrl(`/api/sessions/${encodeURIComponent(name)}/rename`);
+    return fetchJson(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ newName }),
+    }, { timeoutMs: 7000 });
+  },
+  async capturePane(target, machineHost) {
+    const url = machineHost && machineHost !== "local"
+      ? apiUrl(`/api/proxy/${encodeURIComponent(machineHost)}/sessions/${encodeURIComponent(target)}/capture`)
+      : apiUrl(`/api/sessions/${encodeURIComponent(target)}/capture`);
+    return fetchJson(url, {}, { timeoutMs: 3500, retries: 1 });
+  },
+  async getMeshSessions() {
+    return fetchJson(apiUrl("/api/mesh/sessions"), {}, { timeoutMs: 15000, retries: 1 });
+  },
+  async refreshMesh() {
+    return fetchJson(apiUrl("/api/mesh/refresh"), { method: "POST" }, { timeoutMs: 12000, retries: 0 });
+  },
+  async getIdentity() {
+    return fetchJson(apiUrl("/api/identity"), {}, { timeoutMs: 4000, retries: 1 });
+  },
+  async getSidebarGroups() {
+    return fetchJson(apiUrl("/api/sidebar-groups"), {}, { timeoutMs: 4000, retries: 0 });
+  },
+  async postSidebarGroups(entry) {
+    return fetchJson(apiUrl("/api/sidebar-groups"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    }, { timeoutMs: 4000, retries: 0 });
+  },
+};
+
+// --- DOM refs ---
+const $ = (sel) => document.querySelector(sel);
+const views = {
+  sessionList: $("#session-list-view"),
+  terminal: $("#terminal-view"),
+};
+
+// --- Helpers ---
+function isDesktop() {
+  return window.matchMedia("(min-width: 768px)").matches;
+}
+
+// --- View Navigation ---
+function showView(name) {
+  if (isDesktop() && (name === "terminal" || name === "sessionList")) {
+    // On desktop, both session list and terminal are always visible
+    views.sessionList.classList.add("active");
+    views.terminal.classList.add("active");
+    return;
+  }
+  Object.values(views).forEach((v) => v.classList.remove("active"));
+  views[name].classList.add("active");
+}
+
+// --- Session List ---
+
+async function loadSessions() {
+  if (state.sessionsLoadInFlight) {
+    state.sessionsLoadQueued = true;
+    return;
+  }
+
+  state.sessionsLoadInFlight = true;
+  try {
+    try {
+      const result = await api.getMeshSessions();
+      state.sessions = result.sessions || [];
+      state.peerStatus = result.peerStatus || {};
+      state.hasPeers = Object.keys(state.peerStatus).length > 0;
+      state.sessionsLastSuccessAt = Date.now();
+      state.sessionLoadFailures = 0;
+    } catch {
+      // Mesh fetch failed — refresh local sessions but keep cached remote sessions briefly
+      try {
+        const localSessions = await api.getSessions();
+        const localTagged = localSessions.map((s) => ({ ...s, machine: "local", machineHost: "local" }));
+        const meshStalenessMs = Date.now() - (state.sessionsLastSuccessAt || 0);
+        if (state.sessionsLastSuccessAt && state.hasPeers && meshStalenessMs < 60_000) {
+          // Preserve remote sessions from last successful mesh load (max 60s)
+          const remoteSessions = state.sessions.filter((s) => s.machineHost !== "local");
+          state.sessions = [...localTagged, ...remoteSessions];
+        } else {
+          // Remote sessions too stale or never loaded — drop them
+          state.sessions = localTagged;
+          state.peerStatus = {};
+          state.hasPeers = false;
+        }
+      } catch {
+        // Even local fetch failed — keep existing state entirely
+      }
+    }
+    renderPeerStatus();
+    renderSessions();
+    if (state.activeSession) updatePositionIndicator();
+  } catch {
+    state.sessionLoadFailures++;
+  } finally {
+    state.sessionsLoadInFlight = false;
+    if (state.sessionsLoadQueued) {
+      state.sessionsLoadQueued = false;
+      loadSessions();
+    }
+  }
+}
+
+function renderSessionCard(s, showMachineLabel) {
+  return `
+    <div class="session-card${isActiveSession(s.name, s.machineHost) ? " active" : ""}"
+         data-name="${esc(s.name)}"
+         data-pane="${esc(s.paneId)}"
+         data-machine="${esc(s.machine)}"
+         data-machine-host="${esc(s.machineHost)}"
+         data-session-key="${esc(sessionKey(s.name, s.machineHost))}">
+      <span class="drag-handle" data-drag-handle="session" role="button" aria-label="Drag to reorder" title="Drag to reorder">&#10495;</span>
+      <div class="status-dot ${s.status}" style="${activityDotStyle(s)}"></div>
+      <div class="session-info">
+        <div class="session-top-row">
+          <span class="session-name">${esc(s.name)}</span>
+          ${showMachineLabel ? `<span class="machine-badge" style="background:${machineColor(s.machine).bg};color:${machineColor(s.machine).fg}">${esc(s.machine)}</span>` : ""}
+          <span class="session-status-label ${s.status}">${statusLabel(s.status)}</span>
+        </div>
+        <div class="session-bottom-row">
+          <span class="session-agent">${esc(s.agent || "shell")}</span>
+          ${isInterestingCommand(s.currentCommand, s.agent) ? `<span class="session-command">${esc(s.currentCommand)}</span>` : ""}
+          ${s.projectPath ? `<span class="session-project">${esc(s.projectPath)}</span>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderSessions() {
+  const container = $("#sessions-container");
+
+  const filtered = state.machineFilter === "all"
+    ? state.sessions
+    : state.sessions.filter((s) => s.machine === state.machineFilter);
+
+  const groupData = getGroups();
+  const resolved = resolveOrder(groupData, filtered, (s) => sessionKey(s.name, s.machineHost));
+  if (resolved.changed) saveGroups(resolved.data);
+
+  const signature = [
+    state.machineFilter,
+    state.hasPeers ? "peers" : "local",
+    state.activeSession || "",
+    JSON.stringify(resolved.data),
+    ...filtered.map((s) => [
+      s.name,
+      s.machine || "",
+      s.machineHost || "",
+      s.status || "",
+      s.agent || "",
+      s.projectPath || "",
+      s.currentCommand || "",
+      s.paneId || "",
+      s.lastActivity || 0,
+    ].join("|")),
+  ].join("||");
+
+  if (signature === state.renderedSessionsSignature) return;
+  state.renderedSessionsSignature = signature;
+
+  if (filtered.length === 0) {
+    if (state.sessionLoadFailures >= 2) {
+      container.innerHTML = `
+        <div class="empty-state empty-state-panel">
+          <div>Session list looks stale or unavailable.</div>
+          <div class="empty-state-actions">
+            <button class="btn secondary" data-action="retry-load">Retry</button>
+            <button class="btn danger" data-action="reset-app">Reset App</button>
+          </div>
+        </div>`;
+      container.querySelector('[data-action="retry-load"]')?.addEventListener("click", loadSessions);
+      container.querySelector('[data-action="reset-app"]')?.addEventListener("click", resetAppState);
+      return;
+    }
+    container.innerHTML = '<div class="empty-state">No tmux sessions found</div>';
+    return;
+  }
+
+  const showMachineLabel = state.hasPeers;
+
+  // Render groups in the persisted order (empty groups keep a header so they stay droppable).
+  const html = [];
+  for (const group of resolved.groups) {
+    const isCollapsed = group.collapsed;
+    const isEmpty = group.sessions.length === 0;
+    html.push(`
+      <div class="session-group${isEmpty ? " empty" : ""}" data-group="${esc(group.name)}">
+        <div class="session-group-header" data-group="${esc(group.name)}">
+          <span class="drag-handle group-drag-handle" data-drag-handle="group" role="button" aria-label="Drag to reorder group" title="Drag to reorder group">&#10495;</span>
+          <span class="group-chevron${isCollapsed ? " collapsed" : ""}">&#9662;</span>
+          <span class="group-name">${esc(group.name)}</span>
+          <span class="group-count">${group.sessions.length}</span>
+        </div>
+        ${isCollapsed ? "" : `<div class="session-group-body">
+          ${group.sessions.map((session) => renderSessionCard(session, showMachineLabel)).join("")}
+        </div>`}
+      </div>`);
+  }
+
+  // Render ungrouped sessions in manual order.
+  html.push(...resolved.ungrouped.map((s) => renderSessionCard(s, showMachineLabel)));
+
+  container.innerHTML = html.join("");
+
+  bindSessionListInteractions(container);
+}
+
+// --- Sidebar drag & drop (Pointer Events: one path for mouse + touch) ---
+const DRAG_THRESHOLD = 6;
+const AUTOSCROLL_EDGE = 56;
+let drag = null;
+let dropIndicator = null;
+let lastDragEndAt = 0;
+let autoScrollRaf = 0;
+
+function bindSessionListInteractions(container) {
+  container.querySelectorAll(".session-group-header").forEach((header) => {
+    header.addEventListener("click", (e) => {
+      if (e.target.closest("[data-drag-handle]")) return;
+      toggleGroupCollapsed(header.dataset.group);
+      state.renderedSessionsSignature = "";
+      renderSessions();
+    });
+    header.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showGroupContextMenu(e, header.dataset.group);
+    });
+    let pressTimer;
+    header.addEventListener("touchstart", (e) => {
+      if (e.target.closest("[data-drag-handle]")) return;
+      pressTimer = setTimeout(() => {
+        e.preventDefault();
+        showGroupContextMenu(e, header.dataset.group);
+      }, 600);
+    });
+    header.addEventListener("touchend", () => clearTimeout(pressTimer));
+    header.addEventListener("touchmove", () => clearTimeout(pressTimer));
+  });
+
+  container.querySelectorAll(".session-card").forEach((card) => {
+    card.addEventListener("click", () => openTerminal(card.dataset.name, card.dataset.machineHost));
+    card.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showSessionContextMenu(e, card.dataset.name, card.dataset.machineHost);
+    });
+    let pressTimer;
+    card.addEventListener("touchstart", (e) => {
+      if (e.target.closest("[data-drag-handle]")) return;
+      pressTimer = setTimeout(() => {
+        e.preventDefault();
+        showSessionContextMenu(e, card.dataset.name, card.dataset.machineHost);
+      }, 600);
+    });
+    card.addEventListener("touchend", () => clearTimeout(pressTimer));
+    card.addEventListener("touchmove", () => clearTimeout(pressTimer));
+  });
+
+  container.querySelectorAll("[data-drag-handle]").forEach((handle) => {
+    handle.addEventListener("pointerdown", onHandlePointerDown);
+  });
+
+  // Swallow the click that follows a drag so it doesn't open the terminal.
+  if (!container.dataset.dragGuardBound) {
+    container.dataset.dragGuardBound = "1";
+    container.addEventListener(
+      "click",
+      (e) => {
+        if (Date.now() - lastDragEndAt < 350) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      },
+      true,
+    );
+  }
+}
+
+function onHandlePointerDown(e) {
+  const handle = e.currentTarget;
+  const kind = handle.dataset.dragHandle;
+  const el = kind === "group" ? handle.closest(".session-group") : handle.closest(".session-card");
+  if (!el) return;
+  e.preventDefault();
+  try {
+    handle.setPointerCapture(e.pointerId);
+  } catch {
+    /* capture is best-effort */
+  }
+
+  let group = null;
+  let sourceIndex = 0;
+  if (kind === "session") {
+    const grpEl = el.closest(".session-group");
+    group = grpEl ? grpEl.dataset.group : null;
+    sourceIndex = [...el.parentElement.children]
+      .filter((c) => c.classList.contains("session-card"))
+      .indexOf(el);
+  } else {
+    sourceIndex = [...$("#sessions-container").querySelectorAll(".session-group")].indexOf(el);
+  }
+
+  drag = {
+    kind,
+    el,
+    key: el.dataset.sessionKey || null,
+    groupName: kind === "group" ? el.dataset.group : null,
+    group,
+    sourceIndex,
+    startX: e.clientX,
+    startY: e.clientY,
+    lastX: e.clientX,
+    lastY: e.clientY,
+    started: false,
+    drop: null,
+  };
+
+  window.addEventListener("pointermove", onDragMove, { passive: false });
+  window.addEventListener("pointerup", onDragEnd);
+  window.addEventListener("pointercancel", onDragEnd);
+}
+
+function onDragMove(e) {
+  if (!drag) return;
+  drag.lastX = e.clientX;
+  drag.lastY = e.clientY;
+  if (!drag.started) {
+    if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < DRAG_THRESHOLD) return;
+    drag.started = true;
+    drag.el.classList.add("dragging");
+    document.body.classList.add("drag-active");
+    autoScrollRaf = requestAnimationFrame(autoScrollStep);
+  }
+  e.preventDefault();
+  drag.drop = computeDrop(e.clientX, e.clientY);
+  placeIndicator(drag.drop);
+}
+
+function computeDrop(x, y) {
+  const container = $("#sessions-container");
+  const under = document.elementFromPoint(x, y);
+  const closest = (sel) => (under && under.closest ? under.closest(sel) : null);
+
+  if (drag.kind === "group") {
+    const groupEl = closest(".session-group");
+    const groups = [...container.querySelectorAll(".session-group")];
+    if (groupEl && groupEl !== drag.el) {
+      const idx = groups.indexOf(groupEl);
+      const before = y <= groupEl.getBoundingClientRect().top + groupEl.getBoundingClientRect().height / 2;
+      return { kind: "group", index: before ? idx : idx + 1, ref: groupEl, where: before ? "before" : "after" };
+    }
+    return { kind: "group", index: groups.length, ref: container, where: "append" };
+  }
+
+  const card = closest(".session-card");
+  if (card && card !== drag.el && !card.classList.contains("dragging")) {
+    const cards = [...card.parentElement.children].filter((c) => c.classList.contains("session-card"));
+    let idx = cards.indexOf(card);
+    const rect = card.getBoundingClientRect();
+    const before = y <= rect.top + rect.height / 2;
+    if (!before) idx += 1;
+    const grpEl = card.closest(".session-group");
+    return { kind: "session", target: grpEl ? grpEl.dataset.group : null, index: idx, ref: card, where: before ? "before" : "after" };
+  }
+
+  const header = closest(".session-group-header");
+  if (header) {
+    const grpEl = header.closest(".session-group");
+    const body = grpEl.querySelector(".session-group-body");
+    return { kind: "session", target: grpEl.dataset.group, index: Infinity, ref: body || grpEl, where: "append" };
+  }
+
+  const body = closest(".session-group-body");
+  if (body) {
+    const grpEl = body.closest(".session-group");
+    return { kind: "session", target: grpEl.dataset.group, index: Infinity, ref: body, where: "append" };
+  }
+
+  const groupEl = closest(".session-group");
+  if (groupEl) {
+    return { kind: "session", target: groupEl.dataset.group, index: Infinity, ref: groupEl, where: "append" };
+  }
+
+  return { kind: "session", target: null, index: Infinity, ref: container, where: "append" };
+}
+
+function placeIndicator(drop) {
+  if (!dropIndicator) {
+    dropIndicator = document.createElement("div");
+    dropIndicator.className = "drop-indicator";
+  }
+  const ind = dropIndicator;
+  if (!drop.ref) {
+    $("#sessions-container").appendChild(ind);
+  } else if (drop.where === "append") {
+    drop.ref.appendChild(ind);
+  } else if (drop.where === "before") {
+    drop.ref.parentElement.insertBefore(ind, drop.ref);
+  } else {
+    drop.ref.parentElement.insertBefore(ind, drop.ref.nextSibling);
+  }
+}
+
+function autoScrollStep() {
+  if (!drag || !drag.started) return;
+  const container = $("#sessions-container");
+  const rect = container.getBoundingClientRect();
+  if (drag.lastY < rect.top + AUTOSCROLL_EDGE) container.scrollTop -= 14;
+  else if (drag.lastY > rect.bottom - AUTOSCROLL_EDGE) container.scrollTop += 14;
+  autoScrollRaf = requestAnimationFrame(autoScrollStep);
+}
+
+function onDragEnd() {
+  window.removeEventListener("pointermove", onDragMove);
+  window.removeEventListener("pointerup", onDragEnd);
+  window.removeEventListener("pointercancel", onDragEnd);
+  if (autoScrollRaf) {
+    cancelAnimationFrame(autoScrollRaf);
+    autoScrollRaf = 0;
+  }
+
+  const d = drag;
+  drag = null;
+  if (dropIndicator) {
+    dropIndicator.remove();
+    dropIndicator = null;
+  }
+  document.body.classList.remove("drag-active");
+  if (!d) return;
+  d.el.classList.remove("dragging");
+  if (!d.started || !d.drop) return;
+  lastDragEndAt = Date.now();
+
+  const gd = getGroups();
+  let next;
+  if (d.kind === "group") {
+    let index = d.drop.index;
+    // Same list: the dragged group is removed before re-insertion, so shift
+    // the target index down when moving toward the end.
+    if (Number.isInteger(index) && d.sourceIndex < index) index -= 1;
+    next = moveGroup(gd, d.groupName, index);
+  } else {
+    let index = d.drop.index;
+    // Same list: the dragged item is removed before re-insertion, so shift
+    // the target index down when moving toward the end.
+    if (d.drop.target === d.group && Number.isInteger(index) && d.sourceIndex < index) index -= 1;
+    next = moveSession(gd, d.key, d.drop.target, index);
+  }
+  saveGroups(next);
+  state.renderedSessionsSignature = "";
+  renderSessions();
+}
+
+function renderPeerStatus() {
+  const bar = $("#peer-status-bar");
+  if (!state.hasPeers) {
+    bar.classList.add("hidden");
+    return;
+  }
+
+  bar.classList.remove("hidden");
+  const entries = Object.entries(state.peerStatus)
+    .map(([name, status]) => {
+      const ok = status === "ok";
+      return `<span class="peer-indicator ${ok ? "ok" : "error"}" title="${esc(status)}">${esc(name)}</span>`;
+    })
+    .join("");
+  bar.innerHTML = entries;
+
+  // Update machine filter dropdown
+  const filter = $("#machine-filter");
+  const currentVal = filter.value;
+  const machines = new Set(state.sessions.map((s) => s.machine));
+  filter.innerHTML = '<option value="all">All Machines</option>';
+  for (const m of machines) {
+    filter.innerHTML += `<option value="${esc(m)}"${m === currentVal ? " selected" : ""}>${esc(m)}</option>`;
+  }
+  filter.classList.toggle("hidden", machines.size <= 1);
+}
+
+const SHELL_COMMANDS = new Set(["zsh", "bash", "sh", "fish", "dash", "tcsh", "csh", "login"]);
+
+function isInterestingCommand(cmd, agent) {
+  if (!cmd) return false;
+  const base = cmd.split("/").pop().toLowerCase();
+  if (SHELL_COMMANDS.has(base)) return false;
+  // Skip version strings (e.g. "2.1.81")
+  if (/^\d[\d.]*$/.test(base)) return false;
+  // Skip if it just duplicates the agent label
+  if (agent && base === agent.toLowerCase()) return false;
+  return true;
+}
+
+function statusLabel(status) {
+  const labels = {
+    needsInput: "Input",
+    working: "Working",
+    idle: "Idle",
+    ended: "Ended",
+    unknown: "...",
+  };
+  return labels[status] || status;
+}
+
+// Returns a CSS color for inactive sessions: accent fading to muted
+// over 4 hours based on last activity timestamp.
+function activityDotColor(lastActivity) {
+  const isLight = window.matchMedia("(prefers-color-scheme: light)").matches;
+  const fadeTo = isLight ? [180, 180, 200] : [26, 26, 46];
+  if (!lastActivity) return `rgb(${fadeTo[0]},${fadeTo[1]},${fadeTo[2]})`;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const ageSec = nowSec - lastActivity;
+  const FADE_DURATION = 4 * 60 * 60; // 4 hours in seconds
+  const t = Math.min(ageSec / FADE_DURATION, 1); // 0 = just now, 1 = 4h+ ago
+
+  // Lerp from blue (99,102,241) to faded color
+  const r = Math.round(99 + (fadeTo[0] - 99) * t);
+  const g = Math.round(102 + (fadeTo[1] - 102) * t);
+  const b = Math.round(241 + (fadeTo[2] - 241) * t);
+  return `rgb(${r},${g},${b})`;
+}
+
+function activityDotStyle(session) {
+  // Active statuses keep their existing colors
+  if (session.status === "needsInput" || session.status === "working") return "";
+  const color = activityDotColor(session.lastActivity);
+  return `background:${color}; box-shadow: 0 0 6px ${color};`;
+}
+
+// --- Machine Color Palette ---
+// 12 visually distinct colors for machine badges, with dark and light variants.
+const MACHINE_COLORS_DARK = [
+  { bg: "rgba(99,102,241,0.15)",  fg: "#818cf8" },  // indigo
+  { bg: "rgba(52,211,153,0.15)",  fg: "#6ee7b7" },  // emerald
+  { bg: "rgba(251,146,60,0.15)",  fg: "#fb923c" },  // orange
+  { bg: "rgba(147,51,234,0.15)",  fg: "#a78bfa" },  // purple
+  { bg: "rgba(14,165,233,0.15)",  fg: "#38bdf8" },  // sky
+  { bg: "rgba(244,63,94,0.15)",   fg: "#fb7185" },  // rose
+  { bg: "rgba(234,179,8,0.15)",   fg: "#facc15" },  // yellow
+  { bg: "rgba(45,212,191,0.15)",  fg: "#5eead4" },  // teal
+  { bg: "rgba(249,115,22,0.15)",  fg: "#f97316" },  // amber
+  { bg: "rgba(168,85,247,0.15)",  fg: "#c084fc" },  // violet
+  { bg: "rgba(34,211,238,0.15)",  fg: "#22d3ee" },  // cyan
+  { bg: "rgba(163,230,53,0.15)",  fg: "#a3e635" },  // lime
+];
+const MACHINE_COLORS_LIGHT = [
+  { bg: "rgba(79,70,229,0.12)",   fg: "#4338ca" },  // indigo
+  { bg: "rgba(16,185,129,0.12)",  fg: "#047857" },  // emerald
+  { bg: "rgba(234,88,12,0.12)",   fg: "#c2410c" },  // orange
+  { bg: "rgba(126,34,206,0.12)",  fg: "#7e22ce" },  // purple
+  { bg: "rgba(2,132,199,0.12)",   fg: "#0369a1" },  // sky
+  { bg: "rgba(225,29,72,0.12)",   fg: "#be123c" },  // rose
+  { bg: "rgba(161,98,7,0.12)",    fg: "#a16207" },  // yellow
+  { bg: "rgba(13,148,136,0.12)",  fg: "#0d9488" },  // teal
+  { bg: "rgba(194,65,12,0.12)",   fg: "#c2410c" },  // amber
+  { bg: "rgba(126,34,206,0.12)",  fg: "#7c3aed" },  // violet
+  { bg: "rgba(8,145,178,0.12)",   fg: "#0891b2" },  // cyan
+  { bg: "rgba(77,124,15,0.12)",   fg: "#4d7c0f" },  // lime
+];
+
+function getMachineColors() {
+  return window.matchMedia("(prefers-color-scheme: light)").matches
+    ? MACHINE_COLORS_LIGHT
+    : MACHINE_COLORS_DARK;
+}
+
+function machineColor(machineName) {
+  const colors = getMachineColors();
+  if (!machineName) return colors[0];
+  // Deterministic hash (djb2) so every AMA server assigns the same color
+  // to the same machine name, regardless of discovery order.
+  let hash = 5381;
+  for (let i = 0; i < machineName.length; i++) {
+    hash = ((hash * 33) ^ machineName.charCodeAt(i)) >>> 0;
+  }
+  return colors[hash % colors.length];
+}
+
+/** Unique key for a session across machines. */
+function sessionKey(name, machineHost) {
+  return `${machineHost || "local"}::${name}`;
+}
+
+/** Check if a session matches the currently active session. */
+function isActiveSession(name, machineHost) {
+  return name === state.activeSession
+    && (machineHost || "local") === (state.activeSessionMeta?.machineHost || "local");
+}
+
+
+// --- Mobile Input Fix ---
+// iOS virtual keyboards fire `beforeinput` with inputType "deleteContentBackward"
+// for long-press backspace, but xterm.js doesn't always translate repeated events
+// into key-repeat. This patches xterm's internal textarea to forward those events.
+function patchMobileInput(term, getWs) {
+  // xterm.js creates a textarea inside .xterm-helper-textarea
+  const textarea = term.element?.querySelector(".xterm-helper-textarea");
+  if (!textarea) return;
+
+  textarea.addEventListener("beforeinput", (e) => {
+    const ws = getWs();
+    if (!ws || ws.readyState !== 1) return;
+
+    if (e.inputType === "deleteContentBackward") {
+      ws.send(JSON.stringify({ type: "input", data: "\x7f" })); // DEL (backspace)
+      e.preventDefault();
+    } else if (e.inputType === "deleteContentForward") {
+      ws.send(JSON.stringify({ type: "input", data: "\x1b[3~" })); // Forward delete
+      e.preventDefault();
+    }
+  });
+}
+
+// --- Paste Support ---
+// navigator.clipboard.readText() requires HTTPS and fails on HTTP (Tailscale).
+// Instead, listen for the browser's native paste event which works everywhere,
+// including mobile long-press → Paste and desktop Ctrl+V/Cmd+V.
+function patchPaste(term, getWs) {
+  const textarea = term.element?.querySelector(".xterm-helper-textarea");
+  if (!textarea) return;
+
+  textarea.addEventListener("paste", (e) => {
+    const ws = getWs();
+    if (!ws || ws.readyState !== 1) return;
+
+    const text = e.clipboardData?.getData("text");
+    if (text) {
+      ws.send(JSON.stringify({ type: "input", data: text }));
+      e.preventDefault();
+      // Stop xterm's own paste handler from also sending the text
+      e.stopImmediatePropagation();
+    }
+  }, { capture: true });
+}
+
+// --- Session Navigation ---
+// Navigate to the "next" session using priority ordering: needsInput > working > idle.
+// state.sessions is already sorted by this priority from the server.
+function isAgentSession(s) {
+  return s.agent && s.agent !== "shell";
+}
+
+// Agent sessions in sidebar render order (groups first, then ungrouped),
+// skipping sessions inside collapsed groups — matching what's visible in the nav.
+function sidebarNavSessions() {
+  const resolved = resolveOrder(getGroups(), state.sessions, (s) => sessionKey(s.name, s.machineHost));
+  const ordered = resolved.groups
+    .flatMap((g) => (g.collapsed ? [] : g.sessions))
+    .concat(resolved.ungrouped);
+  return ordered.filter((s) => s.paneId && isAgentSession(s));
+}
+
+function navigateNextSession() {
+  const sessions = sidebarNavSessions();
+  if (sessions.length === 0) return;
+
+  const currentIdx = sessions.findIndex((s) => isActiveSession(s.name, s.machineHost));
+  const nextIdx = (currentIdx + 1) % sessions.length;
+  const next = sessions[nextIdx];
+  openTerminal(next.name, next.machineHost);
+}
+
+function navigatePrevSession() {
+  const sessions = sidebarNavSessions();
+  if (sessions.length === 0) return;
+
+  const currentIdx = sessions.findIndex((s) => isActiveSession(s.name, s.machineHost));
+  const prevIdx = (currentIdx - 1 + sessions.length) % sessions.length;
+  const prev = sessions[prevIdx];
+  openTerminal(prev.name, prev.machineHost);
+}
+
+function updatePositionIndicator() {
+  const sessions = sidebarNavSessions();
+  const el = $("#terminal-position");
+  if (!el || sessions.length <= 1) {
+    if (el) el.textContent = "";
+    return;
+  }
+  const idx = sessions.findIndex((s) => isActiveSession(s.name, s.machineHost));
+  el.textContent = idx >= 0 ? `${idx + 1} of ${sessions.length}` : "";
+}
+
+// --- Terminal size ---
+//
+// The browser owns the grid (how many columns and rows fit the terminal
+// container); the server owns a PTY with a size of its own, and tmux sizes
+// the shared pane from the client whose size last *changed*. The two drift
+// apart whenever the page is not the one being looked at: a background tab is
+// not laid out, and a phone that was in another app does not report its new
+// viewport until it is shown again. A stale grid never changes, so no resize
+// frame is sent and the far end keeps the size the page had when it went
+// stale - the phone's size, when the user moves to the desktop.
+//
+// So: re-fit on the way back in (visibility, focus) and before the first
+// keystroke after that, and tell the server the new size when it changed.
+//
+// A size that did not change never reaches tmux, so on its own it cannot put
+// the shared pane back. That is what the claim frame is for: it says "this is
+// the device being looked at", and the server asks tmux for the pane.
+
+// Fit the terminal to its container and report the grid it ended up with.
+function fitGrid(fitAddon, term) {
+  try {
+    fitAddon.fit();
+  } catch {
+    // The container is not laid out yet - keep the size we have.
+  }
+  return { cols: term.cols, rows: term.rows };
+}
+
+// Tell the server the current grid size.
+function pushResize(cols, rows) {
+  if (state.ws?.readyState !== 1) return false;
+  state.ws.send(JSON.stringify({ type: "resize", cols, rows }));
+  state.terminalSize = { cols, rows };
+  return true;
+}
+
+// Tell the server "this is the device being looked at, and this is my grid".
+// The grid travels with the claim because it may have changed while the page
+// was in the background.
+function pushClaim(cols, rows, { touch = false } = {}) {
+  if (state.ws?.readyState !== 1) return false;
+  const frame = claimFrame({ cols, rows }, { touch });
+  if (!frame) return false;
+  state.ws.send(JSON.stringify(frame));
+  state.terminalSize = { cols, rows };
+  return true;
+}
+
+// Re-fit the terminal and tell the server we are the device being looked at.
+function syncTerminalSize({ touch = false } = {}) {
+  const term = state.terminal;
+  const fitAddon = state.fitAddon;
+  if (!term || !fitAddon) return;
+  const size = fitGrid(fitAddon, term);
+  state.terminalSizeStale = false;
+  pushClaim(size.cols, size.rows, { touch });
+}
+
+// The device being looked at keeps saying so.
+//
+// tmux hands a session's shared pane to the client whose size changed last,
+// so a device that comes back - or a phone that wakes up - can take the pane
+// away, and the pane keeps that size until somebody asks for it back. The
+// claim repeats while this page is in front; a page in the background never
+// claims, because nobody is looking at it.
+function startClaimHeartbeat() {
+  stopClaimHeartbeat();
+  state.claimTimer = setInterval(() => {
+    const term = state.terminal;
+    const fitAddon = state.fitAddon;
+    if (!term || !fitAddon) return;
+    if (!shouldHeartbeat({
+      open: true,
+      visible: document.visibilityState === "visible",
+      focused: document.hasFocus(),
+    })) return;
+    const size = fitGrid(fitAddon, term);
+    pushClaim(size.cols, size.rows, { touch: isTouched(state.lastInputAt) });
+  }, CLAIM_HEARTBEAT_MS);
+}
+
+function stopClaimHeartbeat() {
+  if (state.claimTimer) {
+    clearInterval(state.claimTimer);
+    state.claimTimer = null;
+  }
+}
+
+// A claim that follows an interaction is a touch: the user has just said
+// which device this is, so it wins the pane from whatever device was holding
+// it. Typing claims at most once a second - the heartbeat covers the rest,
+// and the server does real work for every claim.
+const TOUCH_CLAIM_MS = 1000;
+
+function pushTouch() {
+  // The user just used this page, so it keeps saying so for a while - the
+  // heartbeat carries the touch on too, not only this claim.
+  state.lastInputAt = Date.now();
+  const term = state.terminal;
+  const fitAddon = state.fitAddon;
+  if (!term || !fitAddon) return;
+  const now = Date.now();
+  if (now - state.lastTouchClaimAt < TOUCH_CLAIM_MS) return;
+  state.lastTouchClaimAt = now;
+  const size = fitGrid(fitAddon, term);
+  pushClaim(size.cols, size.rows, { touch: true });
+}
+
+// --- Terminal ---
+function openTerminal(sessionName, machineHost = "local") {
+  state.activeSession = sessionName;
+  state.activeSessionMeta = { machineHost };
+
+  // Update URL hash for direct-linking
+  const hashTarget = machineHost !== "local"
+    ? `#/session/${encodeURIComponent(sessionName)}/${encodeURIComponent(machineHost)}`
+    : `#/session/${encodeURIComponent(sessionName)}`;
+  if (location.hash !== hashTarget) {
+    history.pushState(null, "", hashTarget);
+  }
+
+  $("#terminal-session-name").textContent = sessionName;
+
+  showView("terminal");
+
+  // Highlight active card on desktop
+  const activeKey = sessionKey(sessionName, machineHost);
+  document.querySelectorAll(".session-card").forEach((c) => {
+    c.classList.toggle("active", c.dataset.sessionKey === activeKey);
+  });
+
+  // Cleanup previous
+  cleanupTerminal();
+
+  // Create terminal
+  const termZoom = ZOOM_STEPS[zoomIndex];
+  const term = new Terminal({
+    fontFamily: '"JetBrains Mono NF", monospace',
+    fontSize: Math.round(14 * termZoom),
+    theme: getTerminalTheme(),
+    cursorBlink: true,
+    allowProposedApi: true,
+    scrollback: 5000,
+  });
+
+  const fitAddon = new FitAddon();
+  term.loadAddon(fitAddon);
+  term.loadAddon(new WebLinksAddon());
+  const unicode11 = new Unicode11Addon();
+  term.loadAddon(unicode11);
+  term.unicode.activeVersion = "11";
+
+  // Intercept Right-Shift key for session navigation.
+  // Right-Shift alone = next session, Right-Shift + Ctrl = previous session.
+  // Right-Shift is ideal because it never conflicts with terminal input.
+  let rightShiftDown = false;
+
+  term.attachCustomKeyEventHandler((event) => {
+    // Cmd+Up / Cmd+Down move through sessions in sidebar order.
+    if (event.metaKey && event.type === "keydown"
+        && (event.key === "ArrowUp" || event.key === "ArrowDown")) {
+      event.preventDefault();
+      if (event.key === "ArrowUp") {
+        navigatePrevSession();
+      } else {
+        navigateNextSession();
+      }
+      return false;
+    }
+    if (event.key === "Shift" && event.location === 2 /* DOM_KEY_LOCATION_RIGHT */) {
+      if (event.type === "keydown" && !rightShiftDown) {
+        rightShiftDown = true;
+      } else if (event.type === "keyup" && rightShiftDown) {
+        rightShiftDown = false;
+        event.preventDefault();
+        if (event.ctrlKey) {
+          navigatePrevSession();
+        } else {
+          navigateNextSession();
+        }
+        return false;
+      }
+      return false; // suppress the shift keypress from reaching the terminal
+    }
+    // If right-shift is held and another key is pressed, cancel navigation
+    // (user is typing a capital letter or symbol with right-shift)
+    if (rightShiftDown && event.type === "keydown" && event.key !== "Shift" && event.key !== "Control") {
+      rightShiftDown = false;
+      return true;
+    }
+    return true;
+  });
+
+  const container = $("#terminal-container");
+  container.innerHTML = "";
+  container.style.opacity = "0";
+  term.open(container);
+
+  // The device being looked at keeps claiming the shared pane.
+  startClaimHeartbeat();
+
+  // Short delay for DOM to settle before fitting
+  requestAnimationFrame(() => {
+    fitAddon.fit();
+    connectWebSocket(sessionName, term, fitAddon, machineHost, container);
+  });
+
+  updatePositionIndicator();
+
+  state.terminal = term;
+  state.fitAddon = fitAddon;
+  // A new terminal means a new PTY on the server: it has to be told the size.
+  state.terminalSize = null;
+
+  // Patch mobile backspace key repeat
+  patchMobileInput(term, () => state.ws);
+  // Patch paste (native browser paste event works on HTTP, unlike clipboard API)
+  patchPaste(term, () => state.ws);
+
+  // Scroll routing:
+  //   - Main screen buffer (Claude, shell): enter tmux copy-mode and send arrow keys.
+  //   - Alternate screen buffer (opencode and other full-screen TUIs): tmux has no
+  //     scrollback to show, so instead forward SGR mouse-wheel events (DECSET 1006)
+  //     directly to the inner app, which manages its own history.
+  const isAltScreen = () => term.buffer.active.type === "alternate";
+
+  const cellAt = (clientX, clientY) => {
+    const rect = container.getBoundingClientRect();
+    const cellW = Math.max(1, rect.width / term.cols);
+    const cellH = Math.max(1, rect.height / term.rows);
+    const col = Math.min(term.cols, Math.max(1, Math.floor((clientX - rect.left) / cellW) + 1));
+    const row = Math.min(term.rows, Math.max(1, Math.floor((clientY - rect.top) / cellH) + 1));
+    return { col, row };
+  };
+
+  const sendWheel = (direction, clientX, clientY) => {
+    const ws = state.ws;
+    if (!ws || ws.readyState !== 1) return;
+    const { col, row } = cellAt(clientX, clientY);
+    const button = direction === "up" ? 64 : 65; // SGR wheel up / down
+    ws.send(JSON.stringify({ type: "input", data: `\x1b[<${button};${col};${row}M` }));
+  };
+
+  // Slow down trackpad/two-finger scroll on both screens.
+  // Main screen: accumulator-based, 1 line per SCROLL_SENSITIVITY px.
+  // Alt screen: fewer SGR wheel events per tick (same divisor).
+  let scrollAccum = 0;
+  const SCROLL_SENSITIVITY = 120;
+
+  // #terminal-container outlives each terminal, so every listener bound here must
+  // be recorded and unbound by cleanupTerminal() — otherwise each session switch
+  // stacks another wheel handler and one notch scrolls N times.
+  state._containerListeners = [];
+  const bindContainer = (type, listener, opts) => {
+    container.addEventListener(type, listener, opts);
+    state._containerListeners.push([type, listener, opts]);
+  };
+
+  bindContainer("wheel", (e) => {
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    if (isAltScreen()) {
+      const direction = e.deltaY < 0 ? "up" : "down";
+      const notches = Math.max(1, Math.round(Math.abs(e.deltaY) / SCROLL_SENSITIVITY));
+      for (let i = 0; i < notches; i++) sendWheel(direction, e.clientX, e.clientY);
+    } else {
+      scrollAccum += e.deltaY;
+      while (Math.abs(scrollAccum) >= SCROLL_SENSITIVITY) {
+        term.scrollLines(scrollAccum > 0 ? 1 : -1);
+        scrollAccum -= Math.sign(scrollAccum) * SCROLL_SENSITIVITY;
+      }
+    }
+  }, { passive: false, capture: true });
+
+  // Mobile: 2-finger vertical swipe.
+  // 1-finger touch passes through to the terminal for normal interaction.
+  if ("ontouchstart" in window) {
+    let touchStartY = 0;
+    let touchAccum = 0;
+    let twoFingerMoved = false;
+    const SCROLL_THRESHOLD = 20; // pixels per scroll step
+
+    bindContainer("touchstart", (e) => {
+      if (e.touches.length === 2) {
+        touchStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        touchAccum = 0;
+        twoFingerMoved = false;
+      }
+    }, { passive: true });
+
+    bindContainer("touchmove", (e) => {
+      if (e.touches.length !== 2) return;
+      const ws = state.ws;
+      if (!ws || ws.readyState !== 1) return;
+
+      const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      const dy = midY - touchStartY;
+      touchStartY = midY;
+      touchAccum += dy;
+      twoFingerMoved = true;
+
+      // Alt-screen TUIs: forward as wheel events; no tmux copy-mode.
+      if (isAltScreen()) {
+        const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        while (Math.abs(touchAccum) >= SCROLL_THRESHOLD) {
+          const direction = touchAccum > 0 ? "up" : "down";
+          sendWheel(direction, midX, midY);
+          touchAccum -= Math.sign(touchAccum) * SCROLL_THRESHOLD;
+        }
+        e.preventDefault();
+        return;
+      }
+
+      // Main screen: enter tmux copy mode on first scroll-up gesture
+      if (!state.inCopyMode && touchAccum > SCROLL_THRESHOLD) {
+        ws.send(JSON.stringify({ type: "input", data: "\x02[" })); // Ctrl-B [
+        state.inCopyMode = true;
+      }
+
+      if (state.inCopyMode) {
+        while (Math.abs(touchAccum) >= SCROLL_THRESHOLD) {
+          const arrow = touchAccum > 0 ? "\x1b[A" : "\x1b[B"; // Up / Down
+          ws.send(JSON.stringify({ type: "input", data: arrow }));
+          touchAccum -= Math.sign(touchAccum) * SCROLL_THRESHOLD;
+        }
+        e.preventDefault();
+      }
+    }, { passive: false });
+
+    bindContainer("touchend", (e) => {
+      // Exit copy mode on 2-finger tap (no movement). Only relevant on main screen.
+      if (state.inCopyMode && !twoFingerMoved && e.touches.length === 0) {
+        const ws = state.ws;
+        if (ws?.readyState === 1) {
+          ws.send(JSON.stringify({ type: "input", data: "q" })); // quit copy mode
+        }
+        state.inCopyMode = false;
+      }
+    }, { passive: true });
+  }
+
+  // Handle resize
+  const resizeHandler = () => {
+    const size = fitGrid(fitAddon, term);
+    const frame = resizeFrame(state.terminalSize, size);
+    if (frame) pushResize(frame.cols, frame.rows);
+  };
+  window.addEventListener("resize", resizeHandler);
+  state._resizeHandler = resizeHandler;
+
+  // Poll for status updates
+  state.pollInterval = setInterval(async () => {
+    try {
+      const session = state.sessions.find((s) => s.name === sessionName && (s.machineHost || "local") === machineHost);
+      const target = session?.paneId || sessionName;
+      const { status } = await api.capturePane(target, machineHost);
+      const dot = $("#terminal-status-dot");
+      dot.className = `status-dot ${status}`;
+      state.terminalPollFailures = 0;
+    } catch {
+      state.terminalPollFailures++;
+      // If pane/status polling repeatedly fails, reopen the terminal automatically.
+      if (state.terminalPollFailures >= 3 && Date.now() - state.terminalLastReconnectAt > 10_000) {
+        reconnectTerminal();
+      }
+    }
+  }, 2000);
+
+  // Setup toolbar
+  setupToolbar("#terminal-view .terminal-toolbar", term);
+}
+
+function scheduleTerminalReconnect(sessionName, machineHost) {
+  if (!state.activeSession || state.activeSession !== sessionName) return;
+  if ((state.activeSessionMeta?.machineHost || "local") !== machineHost) return;
+  if (state.terminalReconnectTimer) return;
+
+  const attempt = Math.min(state.terminalReconnectAttempts, 4);
+  const delayMs = 1000 * (2 ** attempt);
+  state.terminalReconnectAttempts++;
+
+  state.terminalReconnectTimer = setTimeout(() => {
+    state.terminalReconnectTimer = null;
+    if (!state.activeSession || state.activeSession !== sessionName) return;
+    if ((state.activeSessionMeta?.machineHost || "local") !== machineHost) return;
+    reconnectTerminal();
+  }, delayMs);
+}
+
+function connectWebSocket(sessionName, term, fitAddon, machineHost = "local", visContainer = null) {
+  const wsPath = machineHost && machineHost !== "local"
+    ? `/ws/proxy/${encodeURIComponent(machineHost)}/${encodeURIComponent(sessionName)}`
+    : `/ws/terminal/${encodeURIComponent(sessionName)}`;
+  const ws = new WebSocket(`${wsBase()}${wsPath}`);
+  let connectFinished = false;
+
+  // Backpressured writer: keep only one xterm write in flight.
+  // This avoids event-loop stalls under heavy output bursts.
+  let pendingOutput = "";
+  let writeInFlight = false;
+  let flushScheduled = false;
+  let boostBatchUntil = 0;
+
+  const flushOutput = () => {
+    flushScheduled = false;
+    if (writeInFlight || pendingOutput.length === 0) return;
+
+    const isBoosted = Date.now() < boostBatchUntil;
+    const chunkSize = isBoosted ? 96_000 : 48_000;
+    const chunk = pendingOutput.slice(0, chunkSize);
+    pendingOutput = pendingOutput.slice(chunk.length);
+
+    writeInFlight = true;
+    term.write(chunk, () => {
+      writeInFlight = false;
+      if (pendingOutput.length > 0) scheduleFlush();
+    });
+  };
+
+  const scheduleFlush = () => {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    requestAnimationFrame(flushOutput);
+  };
+
+  const writeBuffered = (data) => {
+    pendingOutput += data;
+    scheduleFlush();
+  };
+
+  // After user sends Enter, widen batch window to catch full redraws
+  const onUserInput = (data) => {
+    if (data === "\r" || data === "\n") {
+      boostBatchUntil = Date.now() + 500;
+    }
+  };
+
+  // Buffer the initial PTY redraw, write all at once, then reveal.
+  let settled = false;
+  let initBuf = [];
+  let quietTimer = null;
+
+  const flush = () => {
+    if (settled) return;
+    settled = true;
+    const combined = initBuf.join("");
+    initBuf = [];
+    if (combined.length > 0) {
+      term.write(combined, () => {
+        term.scrollToBottom();
+        if (visContainer) visContainer.style.opacity = "1";
+        term.focus();
+      });
+    } else {
+      if (visContainer) visContainer.style.opacity = "1";
+      term.focus();
+    }
+  };
+
+  // Safety: reveal after 2s no matter what
+  setTimeout(flush, 2000);
+
+  ws.onopen = () => {
+    connectFinished = true;
+    state.terminalReconnectAttempts = 0;
+    if (state.terminalReconnectTimer) {
+      clearTimeout(state.terminalReconnectTimer);
+      state.terminalReconnectTimer = null;
+    }
+    // The server starts the PTY at the size of the first frame it receives,
+    // so this one is always sent - after a fresh fit, so the PTY starts at
+    // the size the browser is actually showing.
+    const size = fitGrid(fitAddon, term);
+    pushResize(size.cols, size.rows);
+    // This browser is the device the user is looking at, so it claims the
+    // shared pane as well - another device may have taken it in the meantime.
+    // It is a touch when the user has just opened this terminal.
+    pushClaim(size.cols, size.rows, { touch: isTouched(state.lastInputAt) });
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === "output") {
+        if (!settled) {
+          initBuf.push(msg.data);
+          clearTimeout(quietTimer);
+          quietTimer = setTimeout(flush, 200);
+        } else {
+          writeBuffered(msg.data);
+        }
+      } else if (msg.type === "exit") {
+        if (!settled) flush();
+        term.write("\r\n[Session ended]\r\n");
+      } else if (msg.type === "error") {
+        if (!settled) flush();
+        term.write(`\r\n\x1b[31mError:\x1b[m ${msg.message}\r\n`);
+        if (msg.message && msg.message.includes("spawn EBADF")) {
+          term.write("\r\n\x1b[33mPTY allocation failed — the server may need a restart.\x1b[m\r\n");
+          term.write("\x1b[33mClose this session, then use Add Session → New → the server will self-heal.\x1b[m\r\n");
+        }
+      } else if (msg.type === "status") {
+        // Event-derived status pushed by the server — update the dot now
+        // instead of waiting for the next capture poll.
+        if (msg.name === sessionName || msg.target === sessionName) {
+          const dot = $("#terminal-status-dot");
+          if (dot) dot.className = `status-dot ${msg.status}`;
+        }
+        loadSessions();
+      }
+    } catch {
+      writeBuffered(evt.data);
+    }
+  };
+
+  ws.onclose = () => {
+    state._wsDisconnected = true;
+    if (ws._expectedClose) return;
+    term.write("\r\n[Disconnected — tap reconnect or switch back to this app]\r\n");
+    scheduleTerminalReconnect(sessionName, machineHost);
+  };
+
+  ws.onerror = () => {
+    state._wsDisconnected = true;
+    if (ws._expectedClose) return;
+    if (!connectFinished) {
+      term.write("\r\n[Connection error]\r\n");
+    }
+    scheduleTerminalReconnect(sessionName, machineHost);
+  };
+
+  // Send terminal input to server
+  term.onData((data) => {
+    if (ws.readyState === 1) {
+      // The grid may have gone stale while the page was in the background.
+      // Re-fit first, so the resize reaches tmux before the keystroke does.
+      if (state.terminalSizeStale) {
+        syncTerminalSize({ touch: true });
+      }
+      // Auto-exit tmux copy mode when user types
+      if (state.inCopyMode) {
+        ws.send(JSON.stringify({ type: "input", data: "q" })); // quit copy mode
+        state.inCopyMode = false;
+      }
+      // Apply sticky Ctrl modifier: convert printable ASCII letter to Ctrl+letter
+      if (state.ctrlActive && data.length === 1) {
+        const code = data.toLowerCase().charCodeAt(0);
+        if (code >= 0x61 && code <= 0x7a) {
+          // a-z → Ctrl+A through Ctrl+Z (0x01-0x1a)
+          data = String.fromCharCode(code - 0x60);
+        }
+        state.ctrlActive = false;
+        document.getElementById("ctrl-mod-btn")?.classList.remove("ctrl-active");
+      }
+      onUserInput(data);
+      ws.send(JSON.stringify({ type: "input", data }));
+    }
+  });
+
+  state.ws = ws;
+  return ws;
+}
+
+function cleanupTerminal() {
+  stopClaimHeartbeat();
+  if (state.terminalReconnectTimer) {
+    clearTimeout(state.terminalReconnectTimer);
+    state.terminalReconnectTimer = null;
+  }
+  state.terminalReconnectAttempts = 0;
+  state.terminalPollFailures = 0;
+  if (state.ws) {
+    state.ws._expectedClose = true;
+    state.ws.close();
+    state.ws = null;
+  }
+  if (state.terminal) {
+    state.terminal.dispose();
+    state.terminal = null;
+  }
+  if (state.fitAddon) {
+    state.fitAddon = null;
+  }
+  if (state.pollInterval) {
+    clearInterval(state.pollInterval);
+    state.pollInterval = null;
+  }
+  if (state._resizeHandler) {
+    window.removeEventListener("resize", state._resizeHandler);
+    state._resizeHandler = null;
+  }
+  if (state._containerListeners) {
+    const container = $("#terminal-container");
+    for (const [type, listener, opts] of state._containerListeners) {
+      container.removeEventListener(type, listener, opts);
+    }
+    state._containerListeners = null;
+  }
+}
+
+function reconnectTerminal() {
+  if (!state.activeSession) return;
+  const { activeSession, activeSessionMeta } = state;
+  const machineHost = activeSessionMeta?.machineHost || "local";
+  state.terminalLastReconnectAt = Date.now();
+  // Full reopen — disposes old terminal + WebSocket, creates fresh ones
+  openTerminal(activeSession, machineHost);
+}
+
+function closeTerminal() {
+  cleanupTerminal();
+  state.activeSession = null;
+  state.activeSessionMeta = null;
+  document.querySelectorAll(".session-card.active").forEach((c) => c.classList.remove("active"));
+  if (location.hash !== "#/") {
+    history.pushState(null, "", "#/");
+  }
+  if (isDesktop()) {
+    // On desktop, clear the terminal panel but keep sidebar visible
+    $("#terminal-container").innerHTML = '<div class="empty-state">Select a session</div>';
+  } else {
+    showView("sessionList");
+  }
+  loadSessions();
+}
+
+
+// --- Toolbar ---
+function setToolbarMode(toolbar, mode) {
+  toolbar.dataset.mode = mode;
+}
+
+function setupToolbar(selector, term) {
+  const toolbar = document.querySelector(selector);
+
+  toolbar.querySelectorAll(".toolbar-btn").forEach((btn) => {
+    // Remove old listeners by cloning
+    const newBtn = btn.cloneNode(true);
+    btn.parentNode.replaceChild(newBtn, btn);
+
+    newBtn.addEventListener("click", (e) => {
+      e.preventDefault();
+      const key = newBtn.dataset.key;
+      const send = newBtn.dataset.send;
+      const action = newBtn.dataset.action;
+      const ws = state.ws;
+
+      if (action === "ctrl-mod") {
+        state.ctrlActive = !state.ctrlActive;
+        document.getElementById("ctrl-mod-btn")?.classList.toggle("ctrl-active", state.ctrlActive);
+        term.focus();
+        return;
+      } else if (action === "next-session") {
+        navigateNextSession();
+        return;
+      } else if (action === "paste") {
+        // Focus the terminal's hidden textarea and use execCommand("paste")
+        // to trigger the native paste flow. This works on HTTP (unlike
+        // navigator.clipboard.readText which requires HTTPS).
+        const term = state.terminal;
+        const textarea = term?.element?.querySelector(".xterm-helper-textarea");
+        if (textarea) {
+          textarea.focus();
+          document.execCommand("paste");
+        } else {
+          // Last resort fallback: prompt
+          const text = prompt("Paste text:");
+          if (text && ws?.readyState === 1) {
+            ws.send(JSON.stringify({ type: "input", data: text }));
+          }
+        }
+      } else if (action === "enter-scroll") {
+        // Send Ctrl-B [ to enter tmux copy mode, then switch toolbar
+        if (ws?.readyState === 1) {
+          ws.send(JSON.stringify({ type: "input", data: "\x02[" }));
+        }
+        setToolbarMode(toolbar, "scroll");
+      } else if (action === "exit-scroll") {
+        // Send Esc to exit tmux copy mode, then switch toolbar back
+        if (ws?.readyState === 1) {
+          ws.send(JSON.stringify({ type: "input", data: "\x1b" }));
+        }
+        setToolbarMode(toolbar, "normal");
+      } else if (send) {
+        // Parse \xNN escape sequences from HTML data attributes into real control chars
+        const data = send.replace(/\\x([0-9a-fA-F]{2})/g, (_m, hex) =>
+          String.fromCharCode(parseInt(hex, 16))
+        );
+        if (ws?.readyState === 1) {
+          ws.send(JSON.stringify({ type: "input", data }));
+        }
+      } else if (key) {
+        const keyMap = {
+          Escape: "\x1b",
+          Tab: "\t",
+          ArrowUp: "\x1b[A",
+          ArrowDown: "\x1b[B",
+          ArrowLeft: "\x1b[D",
+          ArrowRight: "\x1b[C",
+          PageUp: "\x1b[5~",
+          PageDown: "\x1b[6~",
+        };
+        const data = keyMap[key] || key;
+        if (ws?.readyState === 1) {
+          ws.send(JSON.stringify({ type: "input", data }));
+        }
+      }
+
+      term.focus();
+    });
+  });
+}
+
+// --- Swipe to go back ---
+function setupSwipeBack(viewEl, goBackFn) {
+  let startX = 0;
+  let startY = 0;
+  let tracking = false;
+
+  viewEl.addEventListener("touchstart", (e) => {
+    const touch = e.touches[0];
+    // Only trigger from left edge (within 30px)
+    if (touch.clientX < 30) {
+      startX = touch.clientX;
+      startY = touch.clientY;
+      tracking = true;
+    }
+  }, { passive: true });
+
+  viewEl.addEventListener("touchend", (e) => {
+    if (!tracking) return;
+    tracking = false;
+    const touch = e.changedTouches[0];
+    const dx = touch.clientX - startX;
+    const dy = Math.abs(touch.clientY - startY);
+    // Swipe right at least 80px, mostly horizontal
+    if (dx > 80 && dy < dx * 0.5) {
+      goBackFn();
+    }
+  }, { passive: true });
+
+  viewEl.addEventListener("touchmove", () => {}, { passive: true });
+}
+
+setupSwipeBack(views.terminal, closeTerminal);
+
+// --- Add Session Modal ---
+let addSessionMode = "pick"; // pick | new | existing
+
+function showNewSessionModal() {
+  const modal = $("#new-session-modal");
+  modal.classList.remove("hidden");
+  setAddSessionMode("pick");
+}
+
+function hideNewSessionModal() {
+  $("#new-session-modal").classList.add("hidden");
+}
+
+function setAddSessionMode(mode) {
+  addSessionMode = mode;
+
+  // Toggle panels
+  $("#modal-pick").classList.toggle("hidden", mode !== "pick");
+  $("#modal-new").classList.toggle("hidden", mode !== "new");
+  $("#modal-existing").classList.toggle("hidden", mode !== "existing");
+
+  // Back button
+  $("#modal-back").classList.toggle("hidden", mode === "pick");
+
+  // Title
+  const titles = { pick: "Add Session", new: "New Session", existing: "Existing Sessions" };
+  $("#modal-title").textContent = titles[mode] || "Add Session";
+
+  // Load data when switching to list modes
+  if (mode === "existing") loadExistingSessions();
+  if (mode === "new") {
+    const input = $("#new-session-name");
+    input.value = "";
+    populateMachinePicker();
+    setTimeout(() => input.focus(), 100);
+  }
+}
+
+// Pick mode buttons
+document.querySelectorAll("[data-mode]").forEach((btn) => {
+  btn.addEventListener("click", () => setAddSessionMode(btn.dataset.mode));
+});
+
+$("#modal-back").addEventListener("click", () => setAddSessionMode("pick"));
+
+async function populateMachinePicker() {
+  const select = $("#new-session-machine");
+  const localName = state.identity?.name || "This machine";
+
+  // Collect known machines from current sessions + identity peers
+  const machines = [{ name: localName, host: "local" }];
+  const seenHosts = new Set(["local"]);
+
+  // Add peers from identity
+  if (state.identity?.peers) {
+    for (const peer of state.identity.peers) {
+      const host = `${peer.host}:${peer.port || 3456}`;
+      if (!seenHosts.has(host)) {
+        seenHosts.add(host);
+        machines.push({ name: peer.name || peer.host, host });
+      }
+    }
+  }
+
+  // Add any machines we've seen in sessions but aren't in identity peers
+  for (const s of state.sessions) {
+    if (s.machineHost && !seenHosts.has(s.machineHost)) {
+      seenHosts.add(s.machineHost);
+      machines.push({ name: s.machine || s.machineHost, host: s.machineHost });
+    }
+  }
+
+  // Targets are remote machines reached through a launch command (e.g. SSH).
+  // The session itself still lives in this machine's tmux, so targets get a
+  // namespaced value to keep them apart from peer hosts in the same picker.
+  const targets = await api.getTargets().catch(() => []);
+  for (const t of targets) {
+    const value = `target:${t.name}`;
+    if (!seenHosts.has(value)) {
+      seenHosts.add(value);
+      machines.push({ name: t.label || t.name, host: value });
+    }
+  }
+
+  select.innerHTML = machines
+    .map((m) => `<option value="${esc(m.host)}">${esc(m.name)}</option>`)
+    .join("");
+
+  // Only show if there are multiple machines
+  select.classList.toggle("hidden", machines.length <= 1);
+}
+
+async function createSession() {
+  const name = $("#new-session-name").value.trim();
+  if (!name) return;
+
+  const machineHost = $("#new-session-machine").value || "local";
+  const targetName = machineHost.startsWith("target:") ? machineHost.slice(7) : null;
+
+  let result;
+  if (targetName) {
+    // Target sessions run here, but their pane runs the target's launch command.
+    result = await api.createSession(name, { target: targetName });
+  } else if (machineHost && machineHost !== "local") {
+    // Create on remote machine via proxy
+    result = await fetchJson(
+      apiUrl(`/api/proxy/${encodeURIComponent(machineHost)}/sessions`),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      },
+      { timeoutMs: 7000 }
+    );
+  } else {
+    result = await api.createSession(name);
+  }
+
+  if (result.error) {
+    if (result.error.includes("spawn EBADF")) {
+      alert(`Session creation failed: PTY allocation error (EBADF).\n\nThis usually means node-pty's kernel interface is in a bad state.\nClosing this dialog will trigger a server restart — please wait a few seconds, then reload the page.`);
+      try {
+        await fetch(apiUrl("/api/health/restart"), { method: "POST" });
+      } catch {}
+      return;
+    }
+    alert(result.error);
+    return;
+  }
+
+  hideNewSessionModal();
+  await loadSessions();
+  // Auto-open the new session (with machine context for remote)
+  openTerminal(name, !targetName && machineHost !== "local" ? machineHost : undefined);
+}
+
+async function loadExistingSessions() {
+  const container = $("#existing-sessions-list");
+  container.innerHTML = '<div class="empty-state" style="height:100px">Loading...</div>';
+
+  try {
+    const res = await fetch(apiUrl("/api/tmux-sessions"));
+    const names = await res.json();
+
+    if (names.length === 0) {
+      container.innerHTML = '<div class="empty-state" style="height:100px">No tmux sessions found</div>';
+      return;
+    }
+
+    // Sessions already visible in the sidebar
+    const visibleNames = new Set(state.sessions.map((s) => s.name));
+
+    container.innerHTML = names.map((name) => {
+      const isVisible = visibleNames.has(name);
+      return `<div class="modal-list-item" data-session-name="${esc(name)}">
+        <span class="item-name">${esc(name)}</span>
+        ${isVisible ? '<span class="item-meta">visible</span>' : ""}
+      </div>`;
+    }).join("");
+
+    container.querySelectorAll(".modal-list-item").forEach((item) => {
+      item.addEventListener("click", () => {
+        const name = item.dataset.sessionName;
+        hideNewSessionModal();
+        openTerminal(name);
+      });
+    });
+  } catch {
+    container.innerHTML = '<div class="empty-state" style="height:100px">Failed to load</div>';
+  }
+}
+
+// --- Context Menus ---
+function hideContextMenu() {
+  const menu = $("#context-menu");
+  menu.classList.add("hidden");
+  menu.innerHTML = "";
+}
+
+function positionContextMenu(e) {
+  const menu = $("#context-menu");
+  // Use touch position or mouse position
+  const x = e.touches ? e.touches[0].clientX : e.clientX;
+  const y = e.touches ? e.touches[0].clientY : e.clientY;
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.classList.remove("hidden");
+  // Adjust if off-screen
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) {
+    menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+  }
+  if (rect.bottom > window.innerHeight) {
+    menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+  }
+}
+
+function showSessionContextMenu(e, sessionName, machineHost) {
+  const menu = $("#context-menu");
+  const sKey = sessionKey(sessionName, machineHost);
+  const groupData = getGroups();
+  const currentGroup = getSessionGroup(sKey);
+  const groupNames = groupData.order.filter((n) => (groupData.groups[n] || []).length > 0 || n === currentGroup);
+
+  const items = [];
+
+  // "Add to group" submenu
+  if (groupNames.length > 0) {
+    for (const gn of groupNames) {
+      if (gn === currentGroup) continue;
+      items.push(`<div class="ctx-item" data-action="move-to-group" data-group="${esc(gn)}">Move to "${esc(gn)}"</div>`);
+    }
+  }
+  items.push(`<div class="ctx-item" data-action="new-group">Add to new group...</div>`);
+
+  if (currentGroup) {
+    items.push(`<div class="ctx-item" data-action="remove-from-group">Remove from "${esc(currentGroup)}"</div>`);
+  }
+
+  items.push(`<div class="ctx-divider"></div>`);
+  items.push(`<div class="ctx-item" data-action="rename">Rename session</div>`);
+  items.push(`<div class="ctx-item danger" data-action="kill">Kill session</div>`);
+
+  menu.innerHTML = items.join("");
+  positionContextMenu(e);
+
+  // Bind actions
+  menu.querySelectorAll(".ctx-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const action = item.dataset.action;
+      if (action === "rename") {
+        renameSessionAction(sessionName, machineHost);
+      } else if (action === "kill") {
+        confirmDelete(sessionName, machineHost);
+      } else if (action === "new-group") {
+        const name = prompt("Group name:");
+        if (name && name.trim()) {
+          addToGroup(name.trim(), sKey);
+          state.renderedSessionsSignature = "";
+          renderSessions();
+        }
+      } else if (action === "move-to-group") {
+        addToGroup(item.dataset.group, sKey);
+        state.renderedSessionsSignature = "";
+        renderSessions();
+      } else if (action === "remove-from-group") {
+        removeFromGroup(sKey);
+        state.renderedSessionsSignature = "";
+        renderSessions();
+      }
+      hideContextMenu();
+    });
+  });
+}
+
+function showGroupContextMenu(e, groupName) {
+  const menu = $("#context-menu");
+  menu.innerHTML = `
+    <div class="ctx-item" data-action="rename">Rename group</div>
+    <div class="ctx-item" data-action="ungroup">Ungroup all</div>
+    <div class="ctx-divider"></div>
+    <div class="ctx-item danger" data-action="delete">Delete group</div>
+  `;
+  positionContextMenu(e);
+
+  menu.querySelectorAll(".ctx-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const action = item.dataset.action;
+      if (action === "rename") {
+        const newName = prompt("New group name:", groupName);
+        if (newName && newName.trim() && newName.trim() !== groupName) {
+          renameGroup(groupName, newName.trim());
+        }
+      } else if (action === "ungroup") {
+        ungroupAll(groupName);
+      } else if (action === "delete") {
+        deleteGroup(groupName);
+      }
+      hideContextMenu();
+      state.renderedSessionsSignature = "";
+      renderSessions();
+    });
+  });
+}
+
+// Close context menu on outside click
+document.addEventListener("click", (e) => {
+  const menu = $("#context-menu");
+  if (!menu.contains(e.target)) hideContextMenu();
+});
+
+function confirmDelete(sessionName, machineHost = "local") {
+  state._deleteTarget = sessionName;
+  state._deleteTargetHost = machineHost;
+  $("#delete-session-text").textContent = `Kill session "${sessionName}"?`;
+  $("#delete-modal").classList.remove("hidden");
+}
+
+function hideDeleteModal() {
+  $("#delete-modal").classList.add("hidden");
+  state._deleteTarget = null;
+  state._deleteTargetHost = null;
+}
+
+async function doDelete() {
+  if (!state._deleteTarget) return;
+  const deleteName = state._deleteTarget;
+  const deleteHost = state._deleteTargetHost;
+  const wasActive = deleteName === state.activeSession;
+  await api.deleteSession(deleteName, deleteHost);
+  // Eagerly remove the killed session so it disappears even if the next mesh fetch fails
+  state.sessions = state.sessions.filter(
+    (s) => !(s.name === deleteName && s.machineHost === deleteHost)
+  );
+  renderSessions();
+  hideDeleteModal();
+  if (wasActive) {
+    closeTerminal();
+  } else {
+    await loadSessions();
+  }
+}
+
+async function renameSessionAction(sessionName, machineHost) {
+  const newName = prompt(`Rename "${sessionName}" to:`);
+  if (!newName || !newName.trim() || newName.trim() === sessionName) return;
+
+  const trimmed = newName.trim();
+  try {
+    const result = await api.renameSession(sessionName, trimmed, machineHost);
+    if (result.error) {
+      alert("Rename failed: " + result.error);
+      return;
+    }
+  } catch (err) {
+    alert("Rename failed: " + (err.message || err));
+    return;
+  }
+
+  const sKey = sessionKey(sessionName, machineHost);
+  const newSKey = sessionKey(trimmed, machineHost);
+
+  const groupData = getGroups();
+  for (const [gn, members] of Object.entries(groupData.groups)) {
+    const idx = members.indexOf(sKey);
+    if (idx !== -1) {
+      groupData.groups[gn][idx] = newSKey;
+      saveGroups(groupData);
+      break;
+    }
+  }
+
+  if (isActiveSession(sessionName, machineHost)) {
+    state.activeSession = trimmed;
+  }
+
+  state.sessions = state.sessions.map((s) =>
+    s.name === sessionName && (machineHost || "local") === (s.machineHost || "local")
+      ? { ...s, name: trimmed }
+      : s
+  );
+  state.renderedSessionsSignature = "";
+  renderSessions();
+}
+
+// --- Event Bindings ---
+$("#back-btn").addEventListener("click", closeTerminal);
+$("#add-session-btn").addEventListener("click", showNewSessionModal);
+$("#modal-cancel").addEventListener("click", hideNewSessionModal);
+$("#modal-create").addEventListener("click", createSession);
+$("#delete-cancel").addEventListener("click", hideDeleteModal);
+$("#delete-confirm").addEventListener("click", doDelete);
+$("#terminal-reconnect-btn").addEventListener("click", reconnectTerminal);
+$("#terminal-kill-btn").addEventListener("click", () => {
+  if (state.activeSession) {
+    confirmDelete(state.activeSession, state.activeSessionMeta?.machineHost);
+  }
+});
+
+// Machine filter
+$("#machine-filter").addEventListener("change", (e) => {
+  state.machineFilter = e.target.value;
+  renderSessions();
+});
+
+// Enter to create in modal
+$("#new-session-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") createSession();
+  if (e.key === "Escape") hideNewSessionModal();
+});
+
+// Backdrop closes modals
+document.querySelectorAll(".modal-backdrop").forEach((backdrop) => {
+  backdrop.addEventListener("click", () => {
+    hideNewSessionModal();
+    hideDeleteModal();
+  });
+});
+
+// --- Auto-refresh session list ---
+let listPollInterval;
+function startListPolling() {
+  stopListPolling();
+  listPollInterval = setInterval(() => {
+    if (views.sessionList.classList.contains("active")) {
+      // On desktop, avoid constant list re-renders while a terminal is actively streaming.
+      if (isDesktop() && state.activeSession && state.ws?.readyState === 1) return;
+      loadSessions();
+    }
+  }, 3000);
+}
+
+function stopListPolling() {
+  if (listPollInterval) clearInterval(listPollInterval);
+}
+
+// --- Zoom ---
+const ZOOM_STEPS = [0.75, 0.85, 0.9, 1, 1.1, 1.2, 1.35, 1.5];
+const ZOOM_STORAGE_KEY = "allmyagents-zoom";
+
+function getZoomIndex() {
+  const saved = getStoredString(ZOOM_STORAGE_KEY);
+  if (saved !== null) {
+    const idx = ZOOM_STEPS.indexOf(parseFloat(saved));
+    if (idx !== -1) return idx;
+    removeStoredValue(ZOOM_STORAGE_KEY);
+  }
+  return ZOOM_STEPS.indexOf(1);
+}
+
+let zoomIndex = getZoomIndex();
+
+function applyZoom() {
+  const zoom = ZOOM_STEPS[zoomIndex];
+  document.documentElement.style.setProperty("--zoom", zoom);
+  $("#zoom-level").textContent = `${Math.round(zoom * 100)}%`;
+  setStoredValue(ZOOM_STORAGE_KEY, zoom);
+
+  // Also scale terminal font size
+  const termFontSize = Math.round(14 * zoom);
+  if (state.terminal) {
+    state.terminal.options.fontSize = termFontSize;
+    // The zoom changes the grid - tell the server the new size.
+    syncTerminalSize();
+  }
+  applySidebarWidth();
+}
+
+// --- Sidebar resize ---
+const SIDEBAR_WIDTH_KEY = "allmyagents-sidebar-width";
+const SIDEBAR_MIN_PX = 240;
+let sidebarWidth = parseFloat(getStoredString(SIDEBAR_WIDTH_KEY)) || 340;
+
+// Narrowest width at which the top bar's content (title + actions) still fits.
+function sidebarContentMin() {
+  const bar = $("#session-list-view .top-bar");
+  const sidebar = $("#session-list-view");
+  if (!bar || !sidebar) return SIDEBAR_MIN_PX;
+  const cs = getComputedStyle(bar);
+  const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+  const gap = parseFloat(cs.columnGap) || 0;
+  let needed = pad + gap * (bar.children.length - 1);
+  for (const child of bar.children) needed += child.getBoundingClientRect().width;
+  const border = sidebar.offsetWidth - sidebar.clientWidth;
+  return Math.ceil(needed + border);
+}
+
+function clampSidebarWidth(w) {
+  const floor = Math.max(SIDEBAR_MIN_PX * ZOOM_STEPS[zoomIndex], sidebarContentMin());
+  const ceil = Math.max(floor, window.innerWidth * 0.7);
+  return Math.min(Math.max(w, floor), ceil);
+}
+
+function applySidebarWidth() {
+  if (!isDesktop()) return;
+  const el = $("#session-list-view");
+  // Measure the top bar at its natural size, not squeezed by the current width.
+  el.style.setProperty("--sidebar-width", "0px");
+  const w = clampSidebarWidth(sidebarWidth);
+  el.style.setProperty("--sidebar-width", `${w}px`);
+  window.dispatchEvent(new Event("resize"));
+}
+
+function initSidebarResizer() {
+  const handle = $("#sidebar-resizer");
+  if (!handle) return;
+  handle.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    handle.classList.add("dragging");
+    document.body.classList.add("sidebar-resizing");
+    const left = $("#session-list-view").getBoundingClientRect().left;
+    const onMove = (ev) => {
+      sidebarWidth = clampSidebarWidth(ev.clientX - left);
+      $("#session-list-view").style.setProperty("--sidebar-width", `${sidebarWidth}px`);
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onUp = () => {
+      handle.removeEventListener("pointermove", onMove);
+      handle.removeEventListener("pointerup", onUp);
+      handle.removeEventListener("pointercancel", onUp);
+      handle.classList.remove("dragging");
+      document.body.classList.remove("sidebar-resizing");
+      setStoredValue(SIDEBAR_WIDTH_KEY, Math.round(sidebarWidth));
+    };
+    handle.addEventListener("pointermove", onMove);
+    handle.addEventListener("pointerup", onUp);
+    handle.addEventListener("pointercancel", onUp);
+  });
+  handle.addEventListener("dblclick", () => {
+    sidebarWidth = 340;
+    removeStoredValue(SIDEBAR_WIDTH_KEY);
+    applySidebarWidth();
+  });
+  window.addEventListener("resize", () => {
+    // Re-clamp on window resize; skip our own synthetic events cheaply.
+    const el = $("#session-list-view");
+    const cur = parseFloat(el.style.getPropertyValue("--sidebar-width"));
+    if (isDesktop() && cur < sidebarContentMin() - 0.5) applySidebarWidth();
+  });
+}
+
+function zoomUp() {
+  if (zoomIndex < ZOOM_STEPS.length - 1) {
+    zoomIndex++;
+    applyZoom();
+  }
+}
+
+function zoomDown() {
+  if (zoomIndex > 0) {
+    zoomIndex--;
+    applyZoom();
+  }
+}
+
+function zoomReset() {
+  zoomIndex = ZOOM_STEPS.indexOf(1);
+  applyZoom();
+}
+
+function toggleSettingsMenu(open) {
+  const menu = $("#settings-menu");
+  const shouldOpen = open !== undefined ? open : menu.classList.contains("hidden");
+  if (shouldOpen) {
+    menu.classList.remove("hidden");
+  } else {
+    menu.classList.add("hidden");
+  }
+}
+
+// Close settings menu when tapping elsewhere
+document.addEventListener("click", (e) => {
+  const menu = $("#settings-menu");
+  const btn = $("#settings-btn");
+  if (!menu.classList.contains("hidden") && !menu.contains(e.target) && !btn.contains(e.target)) {
+    menu.classList.add("hidden");
+  }
+});
+
+// Don't let clicks inside the menu close it (checkbox/label interactions)
+$("#settings-menu").addEventListener("click", (e) => e.stopPropagation());
+
+$("#settings-btn").addEventListener("click", () => toggleSettingsMenu());
+$("#zoom-up").addEventListener("click", zoomUp);
+$("#zoom-down").addEventListener("click", zoomDown);
+$("#zoom-reset").addEventListener("click", zoomReset);
+$("#reset-btn").addEventListener("click", resetAppState);
+
+// --- Init ---
+async function init() {
+  // Pre-load terminal font before any terminal opens
+  try {
+    await document.fonts.load('14px "JetBrains Mono NF"');
+  } catch { /* font API may not be available */ }
+
+  // Apply saved zoom level
+  initSidebarResizer();
+  applyZoom();
+
+  // Discover best available host (failover if current is down)
+  await discoverActiveHost();
+
+  try {
+    state.identity = await api.getIdentity();
+  } catch { /* standalone mode */ }
+  // Adopt the shared copy of the sidebar BEFORE reconciling against the live
+  // sessions. Reconciling first stamps the local copy with a fresh timestamp,
+  // and a blank local copy with a fresh timestamp beats the server's real
+  // groups — which is how the groups got erased from every surface.
+  await syncGroups();
+  await loadSessions();
+
+  // On desktop, show placeholder in terminal panel
+  if (isDesktop()) {
+    showView("sessionList");
+    $("#terminal-container").innerHTML = '<div class="empty-state">Select a session</div>';
+  }
+
+  consumeResumeAfterReset();
+
+  // Hash-based URL routing: direct-link to sessions
+  function navigateToHash() {
+    const match = location.hash.match(/^#\/session\/([^/]+)(?:\/([^/]+))?$/);
+    if (match) {
+      const name = decodeURIComponent(match[1]);
+      const host = decodeURIComponent(match[2] || "local");
+      // Only navigate if session exists in list and not already viewing it
+      if (state.sessions.some((s) => s.name === name && (s.machineHost || "local") === host)) {
+        if (state.activeSession !== name || (state.activeSessionMeta?.machineHost || "local") !== host) {
+          openTerminal(name, host);
+        }
+      }
+    }
+  }
+  window.addEventListener("hashchange", navigateToHash);
+  navigateToHash();
+}
+
+init();
+startListPolling();
+
+// Live-update terminal theme and session list when system color scheme changes
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  if (state.terminal) {
+    state.terminal.options.theme = getTerminalTheme();
+  }
+  renderSessions(state.sessions);
+});
+
+// Periodic health check — failover if active host goes down
+setInterval(healthCheck, 30_000);
+
+// Recovery watchdog: refresh stalled list view + reconnect dead terminals.
+setInterval(() => {
+  if (document.visibilityState !== "visible") return;
+
+  if (views.sessionList.classList.contains("active")) {
+    // Same skip rule as polling: keep sidebar recovery quiet while live terminal is active.
+    if (!(isDesktop() && state.activeSession && state.ws?.readyState === 1)) {
+      const staleMs = Date.now() - (state.sessionsLastSuccessAt || 0);
+      if (staleMs > 12_000 || state.sessionLoadFailures >= 3) {
+        loadSessions();
+      }
+    }
+  }
+
+  if (state.activeSession && state.ws && state.ws.readyState !== 1) {
+    if (Date.now() - state.terminalLastReconnectAt > 4_000) {
+      reconnectTerminal();
+    }
+  }
+}, 5000);
+
+// Handle visibility change (phone lock/unlock, app switching)
+// Any interaction with the page is the user saying "this is the device I am
+// using", so it takes the shared pane from whatever device was holding it.
+// The listeners are in the capture phase so the claim is on its way before
+// the keystroke reaches the terminal.
+for (const type of ["keydown", "pointerdown", "touchstart", "wheel"]) {
+  document.addEventListener(type, () => pushTouch(), { capture: true, passive: true });
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    if (views.sessionList.classList.contains("active")) {
+      loadSessions();
+    }
+    // Auto-reconnect terminal if WebSocket dropped while app was backgrounded
+    if (state.activeSession && state.ws?.readyState !== 1) {
+      reconnectTerminal();
+    }
+    // The page was not laid out while it was hidden, so the grid is stale:
+    // re-fit it and tell the server, so the terminal is sized for the
+    // viewport it is back in. Coming back is a touch: the user just said
+    // which device this is.
+    state.lastInputAt = Date.now();
+    syncTerminalSize({ touch: true });
+  } else {
+    // The grid can go stale while the page is hidden (the viewport changes,
+    // the tab is not laid out). Remember that, so the first keystroke after
+    // the page comes back re-fits before it is forwarded.
+    state.terminalSizeStale = true;
+  }
+});
+
+// A window that loses focus can be moved, resized or rotated while it is not
+// the one being looked at, and the browser does not always report the new
+// viewport. Re-fit when it comes back.
+window.addEventListener("blur", () => {
+  state.terminalSizeStale = true;
+});
+window.addEventListener("focus", () => {
+  // The user is looking at this window again, so it takes the shared pane.
+  state.lastInputAt = Date.now();
+  syncTerminalSize({ touch: true });
+});

@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#0a0a0a">
+  <title>All My Agents Mobile</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+  <style>
+    @font-face {
+      font-family: 'JetBrains Mono NF';
+      src: url('/fonts/JetBrainsMonoNerdFont-Regular.woff2') format('woff2');
+      font-weight: normal;
+      font-style: normal;
+      font-display: swap;
+    }
+    @font-face {
+      font-family: 'JetBrains Mono NF';
+      src: url('/fonts/JetBrainsMonoNerdFont-Bold.woff2') format('woff2');
+      font-weight: bold;
+      font-style: normal;
+      font-display: swap;
+    }
+  </style>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="desktop-layout">
+    <!-- Session List View -->
+    <div id="session-list-view" class="view active">
+      <header class="top-bar">
+        <h1>All My Agents</h1>
+        <div class="header-actions">
+          <select id="machine-filter" class="machine-filter">
+            <option value="all">All Machines</option>
+          </select>
+<button id="add-session-btn" class="icon-btn" title="New Session">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+          </button>
+          <button id="reset-btn" class="icon-btn" title="Reset App Data">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/>
+              <line x1="12" y1="2" x2="12" y2="12"/>
+            </svg>
+          </button>
+          <button id="settings-btn" class="icon-btn" title="Settings">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+          </button>
+        </div>
+      </header>
+      <div id="peer-status-bar" class="peer-status-bar hidden"></div>
+      <div id="sessions-container" class="sessions-container">
+        <div id="sessions-loading" class="empty-state">Loading sessions...</div>
+      </div>
+    </div>
+
+    <div id="sidebar-resizer" role="separator" aria-orientation="vertical" title="Drag to resize"></div>
+
+    <!-- Terminal View -->
+    <div id="terminal-view" class="view">
+      <header class="top-bar terminal-bar">
+        <button id="back-btn" class="icon-btn" title="Back">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>
+          </svg>
+        </button>
+        <div class="terminal-title">
+          <span id="terminal-session-name"></span>
+          <span id="terminal-status-dot" class="status-dot"></span>
+        </div>
+        <span id="terminal-position" class="terminal-position"></span>
+        <button id="terminal-reconnect-btn" class="icon-btn" title="Reconnect">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+          </svg>
+        </button>
+        <button id="terminal-kill-btn" class="icon-btn danger" title="Kill Session">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
+          </svg>
+        </button>
+      </header>
+      <div id="terminal-container"></div>
+      <div id="terminal-toolbar" class="terminal-toolbar" data-mode="normal">
+        <div class="toolbar-row normal-btn">
+          <button class="toolbar-btn" data-action="paste">Paste</button>
+          <button class="toolbar-btn" data-key="Tab">Tab</button>
+          <button class="toolbar-btn" data-key="Escape">Esc</button>
+          <button class="toolbar-btn" data-key="ArrowLeft">&larr;</button>
+          <button class="toolbar-btn" data-key="ArrowUp">&uarr;</button>
+          <button class="toolbar-btn" data-key="ArrowDown">&darr;</button>
+          <button class="toolbar-btn" data-key="ArrowRight">&rarr;</button>
+        </div>
+        <div class="toolbar-row normal-btn">
+          <button class="toolbar-btn" data-send="\x03">Cancel</button>
+          <button class="toolbar-btn" data-send="\x04">EOF</button>
+          <button class="toolbar-btn" data-send="\x01">Tmux</button>
+          <button class="toolbar-btn" data-action="ctrl-mod" id="ctrl-mod-btn">Ctrl</button>
+          <button class="toolbar-btn" data-action="enter-scroll">Scroll</button>
+          <button class="toolbar-btn" data-action="next-session">Next</button>
+        </div>
+        <div class="toolbar-row scroll-btn hidden">
+          <button class="toolbar-btn" data-action="exit-scroll">Exit Scroll</button>
+          <button class="toolbar-btn" data-key="ArrowUp">&uarr;</button>
+          <button class="toolbar-btn" data-key="ArrowDown">&darr;</button>
+        </div>
+        <div class="toolbar-row scroll-btn hidden">
+          <button class="toolbar-btn" data-key="PageUp">PgUp</button>
+          <button class="toolbar-btn" data-key="PageDown">PgDn</button>
+          <button class="toolbar-btn" data-send="\x02[0">Top</button>
+          <button class="toolbar-btn" data-send="\x02[G">Bottom</button>
+        </div>
+      </div>
+    </div>
+
+    </div><!-- /desktop-layout -->
+
+    <!-- Settings Menu -->
+    <div id="settings-menu" class="settings-menu hidden">
+      <div class="settings-section">
+        <div class="settings-header">Text Size</div>
+        <div class="zoom-row">
+          <button id="zoom-down" class="zoom-btn">-</button>
+          <span id="zoom-level">100%</span>
+          <button id="zoom-up" class="zoom-btn">+</button>
+          <button id="zoom-reset" class="zoom-btn-text">Reset</button>
+        </div>
+      </div>
+      </div>
+    </div>
+
+    <!-- Add Session Modal -->
+    <div id="new-session-modal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content add-session-modal">
+        <div class="modal-header">
+          <button id="modal-back" class="icon-btn hidden" title="Back">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>
+            </svg>
+          </button>
+          <h2 id="modal-title">Add Session</h2>
+          <button id="modal-cancel" class="icon-btn" title="Close">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Pick mode -->
+        <div id="modal-pick" class="modal-panel">
+          <button class="modal-option-btn" data-mode="new">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            <span>New Session</span>
+          </button>
+          <button class="modal-option-btn" data-mode="existing">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/>
+              <line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+            </svg>
+            <span>Existing Session</span>
+          </button>
+        </div>
+
+        <!-- New session mode -->
+        <div id="modal-new" class="modal-panel hidden">
+          <input type="text" id="new-session-name" placeholder="Session name" autocapitalize="none" autocorrect="off" spellcheck="false">
+          <select id="new-session-machine" class="hidden" style="width:100%;padding:10px;border-radius:8px;border:1px solid #444;background:#1a1a2e;color:#e0e0e0;font-size:14px;margin-top:8px;">
+            <option value="local">This machine</option>
+          </select>
+          <div class="modal-actions">
+            <button id="modal-create" class="btn primary" style="flex:1">Create</button>
+          </div>
+        </div>
+
+        <!-- Existing sessions mode -->
+        <div id="modal-existing" class="modal-panel hidden">
+          <div id="existing-sessions-list" class="modal-scroll-list">
+            <div class="empty-state" style="height:100px">Loading...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context Menu -->
+    <div id="context-menu" class="context-menu hidden"></div>
+
+    <!-- Confirm Delete Modal -->
+    <div id="delete-modal" class="modal hidden">
+      <div class="modal-backdrop"></div>
+      <div class="modal-content">
+        <h2>Kill Session</h2>
+        <p id="delete-session-text">Kill session "name"?</p>
+        <div class="modal-actions">
+          <button id="delete-cancel" class="btn secondary">Cancel</button>
+          <button id="delete-confirm" class="btn danger">Kill</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/+esm"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/+esm"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/+esm"></script>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@xterm/addon-unicode11@0.8.0/+esm"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

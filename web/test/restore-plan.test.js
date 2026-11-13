@@ -1,0 +1,198 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { buildRestorePlan } from "../restore-plan.js";
+
+const REGISTRY = {
+  version: 1,
+  updatedAt: "2026-09-01T12:00:00.000Z",
+  sessions: [
+    { tmux: "ama-stuff", dir: "/repos/all-my-agents-web", sessionId: "ses_aaa", agent: "opencode", firstSeen: "x", lastActive: "x" },
+    { tmux: "fix-bug", dir: "/repos/other", sessionId: "ses_bbb", agent: "opencode", firstSeen: "x", lastActive: "x" },
+  ],
+};
+
+test("resumes each entry when its session id resolves", () => {
+  const actions = buildRestorePlan({
+    registry: REGISTRY,
+    existingTmux: [],
+    resolvable: new Set(["ses_aaa", "ses_bbb"]),
+  });
+
+  assert.deepEqual(actions, [
+    { kind: "launch-opencode", name: "ama-stuff", dir: "/repos/all-my-agents-web", sessionId: "ses_aaa", continueBest: false, reason: "resume" },
+    { kind: "launch-opencode", name: "fix-bug", dir: "/repos/other", sessionId: "ses_bbb", continueBest: false, reason: "resume" },
+  ]);
+});
+
+test("degrades to continue-last when a session id is unresolvable", () => {
+  const actions = buildRestorePlan({
+    registry: REGISTRY,
+    existingTmux: [],
+    resolvable: new Set(["ses_aaa"]),
+  });
+
+  const degraded = actions.find((a) => a.name === "fix-bug");
+  assert.ok(degraded);
+  assert.equal(degraded.continueBest, true);
+  assert.equal(degraded.sessionId, null);
+  assert.equal(degraded.reason, "degrade");
+});
+
+test("degrades when the entry never had a session id", () => {
+  const registry = {
+    version: 1,
+    updatedAt: "x",
+    sessions: [
+      { tmux: "fresh", dir: "/repos/fresh", sessionId: null, agent: "opencode", firstSeen: "x", lastActive: "x" },
+    ],
+  };
+
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, [
+    { kind: "launch-opencode", name: "fresh", dir: "/repos/fresh", sessionId: null, continueBest: true, reason: "degrade" },
+  ]);
+});
+
+test("skips entries whose tmux session already exists (idempotent boot)", () => {
+  const actions = buildRestorePlan({
+    registry: REGISTRY,
+    existingTmux: ["ama-stuff"],
+    resolvable: new Set(["ses_bbb"]),
+  });
+
+  assert.deepEqual(actions.map((a) => a.name), ["fix-bug"]);
+});
+
+test("returns an empty plan for an empty registry", () => {
+  const actions = buildRestorePlan({ registry: { version: 1, updatedAt: "x", sessions: [] }, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, []);
+});
+
+test("returns an empty plan for a missing registry", () => {
+  assert.deepEqual(buildRestorePlan({ registry: null, existingTmux: [], resolvable: new Set() }), []);
+});
+
+test("plans a bare-shell recreate for a non-opencode entry", () => {
+  const registry = {
+    version: 1,
+    updatedAt: "x",
+    sessions: [
+      { tmux: "scratch", dir: "/tmp/scratch", sessionId: null, agent: "shell", firstSeen: "x", lastActive: "x" },
+    ],
+  };
+
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, [
+    { kind: "recreate-shell", name: "scratch", dir: "/tmp/scratch", agent: "shell", reason: "recreate-shell" },
+  ]);
+});
+
+test("plans a bare-shell recreate for a still-unclassified entry", () => {
+  const registry = {
+    version: 1,
+    updatedAt: "x",
+    sessions: [
+      { tmux: "unclear", dir: null, sessionId: null, agent: null, firstSeen: "x", lastActive: "x" },
+    ],
+  };
+
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, [
+    { kind: "recreate-shell", name: "unclear", dir: null, agent: null, reason: "recreate-shell" },
+  ]);
+});
+
+test("a shell entry is never resumed even when it carries a session id", () => {
+  // Only opencode-classified panes are resumable. A stale session id on a
+  // shell entry must not be treated as a conversation to re-attach.
+  const registry = {
+    version: 1,
+    updatedAt: "x",
+    sessions: [
+      { tmux: "stale", dir: "/repos/x", sessionId: "ses_stale", agent: "shell", firstSeen: "x", lastActive: "x" },
+    ],
+  };
+
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set(["ses_stale"]) });
+  assert.deepEqual(actions, [
+    { kind: "recreate-shell", name: "stale", dir: "/repos/x", agent: "shell", reason: "recreate-shell" },
+  ]);
+});
+
+const CLAUDE_ID = "0d78b2d1-52d2-47c9-9de2-0e7e21622269";
+
+function claudeRegistry(entry = {}) {
+  return {
+    version: 2,
+    updatedAt: "x",
+    sessions: [
+      { tmux: "questions", dir: "/home/example/project", sessionId: CLAUDE_ID, agent: "Claude Code", firstSeen: "x", lastActive: "x", ...entry },
+    ],
+  };
+}
+
+test("resumes a Claude Code entry when its transcript resolves", () => {
+  const actions = buildRestorePlan({
+    registry: claudeRegistry(),
+    existingTmux: [],
+    resolvable: new Set([CLAUDE_ID]),
+  });
+
+  assert.deepEqual(actions, [
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", sessionId: CLAUDE_ID, reason: "resume" },
+  ]);
+});
+
+test("degrades a Claude Code entry to a fresh claude when the transcript is gone", () => {
+  // `claude -c` is deliberately not used: two panes in the same dir would both
+  // continue the same "most recent" conversation.
+  const actions = buildRestorePlan({
+    registry: claudeRegistry(),
+    existingTmux: [],
+    resolvable: new Set(),
+  });
+
+  assert.deepEqual(actions, [
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", sessionId: null, reason: "degrade" },
+  ]);
+});
+
+test("a Claude Code entry that never captured an id still launches claude", () => {
+  const actions = buildRestorePlan({
+    registry: claudeRegistry({ sessionId: null }),
+    existingTmux: [],
+    resolvable: new Set([CLAUDE_ID]),
+  });
+
+  assert.deepEqual(actions, [
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", sessionId: null, reason: "degrade" },
+  ]);
+});
+test("a session with a launch spec is relaunched rather than resumed", () => {
+  const registry = {
+    version: 1,
+    updatedAt: "2026-09-01T12:00:00.000Z",
+    sessions: [
+      { tmux: "win", dir: null, sessionId: null, agent: "shell", launch: { kind: "target", name: "windows-vm" }, firstSeen: "x", lastActive: "x" },
+    ],
+  };
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, [
+    { kind: "relaunch-command", name: "win", dir: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+  ]);
+});
+
+test("a launch spec takes precedence over a resumable agent", () => {
+  const registry = {
+    version: 1,
+    updatedAt: "2026-09-01T12:00:00.000Z",
+    sessions: [
+      { tmux: "win", dir: "/repos/a", sessionId: "ses_aaa", agent: "opencode", launch: { kind: "target", name: "windows-vm" }, firstSeen: "x", lastActive: "x" },
+    ],
+  };
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set(["ses_aaa"]) });
+  assert.deepEqual(actions, [
+    { kind: "relaunch-command", name: "win", dir: "/repos/a", launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+  ]);
+});

@@ -1,0 +1,1768 @@
+import express from "express";
+import expressWs from "express-ws";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { access, readFile, readdir } from "node:fs/promises";
+import { accessSync, createWriteStream, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import WebSocket from "ws";
+import { resolveConfig, fetchAllMeshSessions, clearDiscoveryCache, discoverSelfMagicDnsName } from "./mesh.js";
+import { reconcileRegistry, REGISTRY_VERSION } from "./session-registry.js";
+import { createInbox } from "./ws-inbox.js";
+import {
+  buildLocalAuthorities,
+  buildPeerAuthorities,
+  isAllowedOrigin as isOriginAllowed,
+} from "./origin-allowlist.js";
+import { buildRestorePlan } from "./restore-plan.js";
+import { indexClaudeSessions, isClaudeSessionId } from "./claude-session-index.js";
+import { detectStatusFromScreen } from "./agent-status.js";
+import { EVENT_TYPES, applyEvent, eventStatus, resolveIdentity } from "./agent-events.js";
+import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
+import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
+import { isTrustedConnection } from "./network-access.js";
+import { pickWinner, sanitizeSidebarOrder } from "./public/sidebar-sync.js";
+import { readSize, CLAIM_FRAME_TYPE } from "./public/terminal-size.js";
+import { buildListClientsArgs, buildSwitchClientArgs, findClientByPid, parseClientList } from "./tmux-client.js";
+import { createLease, requestLease, releaseLease } from "./pane-lease.js";
+
+// --- Logging ---
+const LOG_DIR = process.env.ALL_MY_AGENTS_LOG_DIR || join(os.homedir(), ".local", "state", "all-my-agents");
+mkdirSync(LOG_DIR, { recursive: true });
+const logStream = createWriteStream(join(LOG_DIR, "server.log"), { flags: "a" });
+
+function log(level, msg, extra) {
+  const ts = new Date().toISOString();
+  const line = extra
+    ? `${ts} [${level}] ${msg} ${JSON.stringify(extra)}`
+    : `${ts} [${level}] ${msg}`;
+  if (level === "ERROR") {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+  logStream.write(line + "\n");
+}
+
+const execFileAsync = promisify(execFile);
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const app = express();
+expressWs(app);
+
+// The port is read before the allowlist, which needs it.
+const PORT = parseInt(process.env.ALL_MY_AGENTS_PORT || "3456", 10);
+
+// --- Origin allowlist -------------------------------------------------------
+//
+// The API can create a session that runs a command, and the terminal
+// WebSocket can type into one, so neither may be reachable from a page the
+// user happens to be visiting. A browser sends an Origin header; a command
+// line client sends none. A request is accepted when it carries no Origin,
+// or when its Origin names this machine or a mesh peer — the web UI fails
+// over to a peer by calling it cross-origin. Anything else is refused.
+//
+// The Origin, not the Host header, is the authority. A DNS-rebinding attack
+// makes the browser send Host: attacker.example and
+// Origin: http://attacker.example: the two agree with each other, and
+// neither names this machine, so the Origin check refuses it.
+//
+// A wildcard would be simpler, and wrong: with one, every web page the user
+// visits could drive this API, which is remote code execution against the
+// machine hosting AMA.
+
+// Every authority that serves this machine: its names, on its own port.
+// The port is part of the match — "http://localhost" is a different server
+// from "http://localhost:3456", and a malicious local web server must not be
+// able to drive the API on this one.
+const LOCAL_AUTHORITIES = buildLocalAuthorities({
+  hostname: os.hostname(),
+  addresses: Object.values(os.networkInterfaces()).flat(),
+  port: PORT,
+});
+
+// This machine's own MagicDNS name, in full — machine AND tailnet. Only the
+// whole name identifies it: the tailnet segment is chosen by whoever owns the
+// tailnet, so another tailnet can publish a name starting with the same short
+// hostname and a page served from there must not be trusted with this API.
+// When Tailscale cannot be asked, no MagicDNS name is trusted at all.
+async function localMagicDnsNames() {
+  const dnsName = await discoverSelfMagicDnsName();
+  return dnsName ? new Set([dnsName]) : new Set();
+}
+
+let peerAuthorities = new Set();
+let peerAuthoritiesAt = 0;
+
+// Known mesh peers, as the authorities they serve on.
+async function knownPeerAuthorities() {
+  const now = Date.now();
+  if (now - peerAuthoritiesAt < 60000) return peerAuthorities;
+  peerAuthoritiesAt = now;
+  const authorities = new Set();
+  try {
+    const config = await resolveConfig();
+    authorities.add(...buildPeerAuthorities(config.peers ?? [], PORT));
+  } catch {
+    // Discovery failed: stay local-only rather than opening up.
+  }
+  peerAuthorities = authorities;
+  return authorities;
+}
+
+async function isAllowedOrigin(origin) {
+  return isOriginAllowed(origin, {
+    localAuthorities: LOCAL_AUTHORITIES,
+    peerAuthorities: await knownPeerAuthorities(),
+    magicDnsNames: await localMagicDnsNames(),
+    magicDnsPort: PORT,
+  });
+}
+
+// A WebSocket upgrade carries an Origin but is not subject to CORS, so the
+// browser's same-origin rules do not apply to it and the check has to be
+// made here.
+async function isAllowedRequestOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // not a browser
+  return isAllowedOrigin(origin);
+}
+
+app.use(express.json());
+app.use(async (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  const origin = req.headers.origin;
+  if (origin) {
+    if (!await isAllowedOrigin(origin)) {
+      log("WARN", "Refused cross-origin request", { origin, path: req.path });
+      return res.status(403).json({ error: "origin not allowed" });
+    }
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Vary", "Origin");
+  }
+  res.set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    // The browser sends a preflight before a cross-origin POST with a JSON
+    // body. Without this answer the preflight 404s and the real request is
+    // never sent, so a cross-origin failover silently could not work.
+    res.set("Access-Control-Max-Age", "600");
+    return res.status(204).end();
+  }
+  next();
+});
+app.use(express.static(join(__dirname, "public")));
+
+// --- Config ---
+const TMUX = findTmux();
+
+function findTmux() {
+  const candidates = [
+    "/opt/homebrew/bin/tmux",
+    "/usr/local/bin/tmux",
+    "/usr/bin/tmux",
+  ];
+  for (const p of candidates) {
+    try {
+      accessSync(p);
+      return p;
+    } catch {
+      /* skip */
+    }
+  }
+  return "tmux";
+}
+
+async function tmux(...args) {
+  const { stdout } = await execFileAsync(TMUX, args, { timeout: 5000 });
+  return stdout.trim();
+}
+
+// Wait for a pane's shell to draw its first prompt. Typing before the shell
+// has taken over the terminal gets the command echoed twice — once by the tty
+// and once by the shell's line editor. The prompt is normally up within a few
+// tens of milliseconds, so a short bounded poll is enough; a shell that never
+// draws one just falls through to the timeout.
+async function waitForShellPrompt(paneId, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const content = await tmux("capture-pane", "-t", paneId, "-p").catch(() => "");
+    if (content) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+// Create a pane and, when it has a command, type that command into it.
+//
+// The pane is a shell and the command is something run inside it, not the
+// pane's process. That is the whole point: when the command ends — an agent
+// exiting, an ssh connection dropping — the shell is still there, so the
+// session survives and the user is back at a prompt rather than watching
+// their tile vanish from the sidebar.
+async function launchPane({ name, dir, token, command, timeoutMs = 5000 } = {}) {
+  let paneId;
+  try {
+    const { stdout } = await execFileAsync(TMUX, buildLaunchArgs({ name, dir, token }), {
+      timeout: timeoutMs,
+    });
+    paneId = stdout.trim();
+  } catch (err) {
+    // tmux refuses a duplicate session name. That is the caller's mistake,
+    // not a fault in the server, so it must not count towards the self-heal
+    // counter: five typos would otherwise take the server down.
+    if (/duplicate session/i.test(err.message)) err.duplicateSession = true;
+    throw err;
+  }
+  // The pane id is server-generated, but it is used as a tmux target, and a
+  // stray line of tmux output would become a target argument. Refuse to use
+  // anything that is not a pane id.
+  if (!/^%\d+$/.test(paneId)) throw new Error("tmux returned an unexpected pane id");
+  if (!command) return paneId;
+  // Typing into a shell that has not drawn its prompt yet echoes the command
+  // twice and can lose characters, so the launch is abandoned rather than
+  // typed into an unprepared pane.
+  if (!await waitForShellPrompt(paneId, timeoutMs)) {
+    throw new Error("the pane's shell never became ready");
+  }
+  await execFileAsync(TMUX, buildLaunchInputArgs(paneId, command), { timeout: timeoutMs });
+  await execFileAsync(TMUX, buildLaunchSubmitArgs(paneId), { timeout: timeoutMs });
+  return paneId;
+}
+
+// --- Self-Healing ---
+// Tracks spawn/PTY errors. If too many in a sliding window, exits the process
+// so launchd (with KeepAlive) restarts cleanly.
+let spawnErrorWindow = [];
+
+// An error message from execFile embeds the full argv. A tmux failure would
+// otherwise write a pane's surface token into the log file and into the HTTP
+// response body, so every live token is scrubbed from every message.
+function redactTokens(message) {
+  if (typeof message !== "string") return message;
+  let out = message;
+  for (const token of surfaceTokens.keys()) {
+    if (token) out = out.split(token).join("[redacted]");
+  }
+  return out;
+}
+
+function recordSpawnError(err) {
+  const now = Date.now();
+  const WINDOW_MS = 120_000;
+  const MAX_ERRORS = 5;
+
+  while (spawnErrorWindow.length > 0 && spawnErrorWindow[0] < now - WINDOW_MS) {
+    spawnErrorWindow.shift();
+  }
+  spawnErrorWindow.push(now);
+
+  log("ERROR", "Spawn error recorded", {
+    count: spawnErrorWindow.length, max: MAX_ERRORS, windowSec: WINDOW_MS / 1000, error: redactTokens(err.message),
+  });
+
+  if (spawnErrorWindow.length >= MAX_ERRORS) {
+    log("FATAL", `${MAX_ERRORS} spawn errors in ${WINDOW_MS / 1000}s — exiting for launchd restart`);
+    process.exit(1);
+  }
+}
+
+async function checkPtyHealth() {
+  try {
+    const p = pty.spawn("/bin/echo", ["health"], { cols: 80, rows: 24, name: "xterm-256color" });
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => { try { p.kill(); } catch {} resolve(false); }, 3000);
+      p.onData((data) => {
+        clearTimeout(timer);
+        try { p.kill(); } catch {}
+        resolve(data.trim() === "health");
+      });
+      p.onExit(() => { clearTimeout(timer); resolve(false); });
+    });
+  } catch { return false; }
+}
+
+// --- Validation ---
+// Allows session names, pane IDs (%123), and tmux target syntax (session:window.pane)
+const TMUX_TARGET_RE = /^[a-zA-Z0-9_.%:-]+$/;
+const PEER_HOST_RE = /^[\w.\-]+:\d{1,5}$/;
+
+function validateTarget(res, target) {
+  if (!target || !TMUX_TARGET_RE.test(target)) {
+    res.status(400).json({ error: "Invalid session target" });
+    return false;
+  }
+  return true;
+}
+
+function validatePeerHost(res, peerHost, config) {
+  if (!PEER_HOST_RE.test(peerHost)) {
+    res.status(400).json({ error: "Invalid peer host format" });
+    return false;
+  }
+  const allowed = config.peers.some(
+    (p) => `${p.host}:${p.port || PORT}` === peerHost
+  );
+  if (!allowed) {
+    const known = config.peers.map((p) => `${p.host}:${p.port || PORT}`);
+    log("WARN", "Peer not in mesh config", { requested: peerHost, knownPeers: known });
+    res.status(403).json({ error: "Peer not in mesh config" });
+    return false;
+  }
+  return true;
+}
+
+// --- API Routes ---
+
+// List all tmux sessions with pane details
+app.get("/api/sessions", async (_req, res) => {
+  try {
+    const sessions = await discoverSessions();
+    res.json(sessions);
+  } catch (err) {
+    res.json([]);
+  }
+});
+
+// Create a new tmux session
+app.post("/api/sessions", async (req, res) => {
+  const { name, command, target } = req.body || {};
+  if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
+    return res.status(400).json({ error: "Invalid session name (alphanumeric, -, _ only)" });
+  }
+  // A session may run a launch command instead of a plain shell. That is how
+  // AMA reaches a machine it cannot host natively: the pane runs an ssh
+  // client and the agent on the far side is driven through that connection.
+  let spec = null;
+  let config = null;
+  if (target) {
+    config = await resolveConfig();
+    spec = buildLaunchSpec({ target });
+  } else {
+    const validated = validateLaunchCommand(command);
+    if (!validated.ok) {
+      return res.status(400).json({ error: validated.error });
+    }
+    spec = buildLaunchSpec({ command: validated.command });
+  }
+  let token = null;
+  try {
+    // Mint a surface token for the new pane and pass it through its environment,
+    // so an agent adapter inside the pane can identify itself on /api/events.
+    token = newSurfaceToken();
+    let launchCommand = null;
+    if (spec) {
+      // The command is built on the server from the mesh config, so the browser
+      // never supplies the command line itself.
+      const rendered = renderLaunchCommand(spec, { targets: config?.targets ?? [], token });
+      if (!rendered.ok) {
+        return res.status(400).json({ error: rendered.error });
+      }
+      launchCommand = rendered.command;
+    }
+    surfaceTokens.set(token, name);
+    await launchPane({ name, token, command: launchCommand });
+    // The spec is recorded only once the pane exists: recording it first
+    // would let a failed launch overwrite the spec of the session that
+    // already holds the name.
+    launchSpecs.set(name, spec);
+    res.json({ ok: true, name, command: launchCommand });
+  } catch (err) {
+    // A name that is already taken is the caller's mistake, not a fault in
+    // the server: it is answered as a conflict and it does not count towards
+    // the self-heal counter.
+    if (err.duplicateSession) {
+      if (token) surfaceTokens.delete(token);
+      log("WARN", "Session name already in use", { name });
+      return res.status(409).json({ error: "Session name already in use" });
+    }
+    recordSpawnError(err);
+    res.status(500).json({ error: redactTokens(err.message) });
+  }
+});
+
+// Targets are the machines a session can reach through a launch command.
+// Only the names are exposed: the host, user and identity path stay in the
+// server's own config.
+app.get("/api/targets", async (_req, res) => {
+  const config = await resolveConfig();
+  const targets = Array.isArray(config.targets) ? config.targets : [];
+  res.json(targets.map((t) => ({ name: t.name, label: t.label || t.name })));
+});
+
+// List all tmux session names (for "add existing" picker)
+app.get("/api/tmux-sessions", async (_req, res) => {
+  try {
+    const output = await tmux("list-sessions", "-F", "#{session_name}");
+    const names = output.split("\n").filter((n) => n && !n.startsWith("_ah_")).sort();
+    res.json(names);
+  } catch {
+    res.json([]);
+  }
+});
+
+// --- Session Registry & Restore ---
+// AMA keeps a live registry of every managed agent session (a tmux session
+// hosting an opencode TUI) keyed by tmux name. The registry is written on every
+// change, so it survives a hard power-off. At startup server.js replays it,
+// recreating each tmux session and resuming the opencode conversation directly
+// with `opencode -s <id>` — no export/import snapshots involved.
+const REGISTRY_PATH = join(LOG_DIR, "active-sessions.json");
+const REGISTRY_POLL_MS = parseInt(process.env.ALL_MY_AGENTS_REGISTRY_POLL_MS || "30000", 10);
+const RESTORE_DELAY_MS = parseInt(process.env.ALL_MY_AGENTS_RESTORE_DELAY_MS || "10000", 10);
+// A pane with no visible prompt and no output change for this long is at rest.
+const QUIET_MS = parseInt(process.env.ALL_MY_AGENTS_QUIET_MS || "6000", 10);
+// Event-derived working/idle older than this falls back to screen detection.
+// needsInput/ended never expire — see agent-events.js.
+const EVENT_TTL_MS = parseInt(process.env.ALL_MY_AGENTS_EVENT_TTL_MS || "120000", 10);
+// Not on launchd's PATH, so use the explicit binary (override via OPENCODE_BIN).
+const OPENCODE_BIN = process.env.OPENCODE_BIN || join(os.homedir(), ".opencode", "bin", "opencode");
+// Claude Code has the same PATH problem (override via CLAUDE_BIN).
+const CLAUDE_BIN = process.env.CLAUDE_BIN || join(os.homedir(), ".local", "bin", "claude");
+const CLAUDE_SESSIONS_DIR = process.env.CLAUDE_SESSIONS_DIR || join(os.homedir(), ".claude", "sessions");
+const CLAUDE_PROJECTS_DIR = process.env.CLAUDE_PROJECTS_DIR || join(os.homedir(), ".claude", "projects");
+
+let registryCache = { registry: null };
+
+function loadRegistry() {
+  try {
+    const parsed = JSON.parse(readFileSync(REGISTRY_PATH, "utf8"));
+    return parsed && Array.isArray(parsed.sessions) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+registryCache.registry = loadRegistry();
+
+function saveRegistry(registry) {
+  const tmp = `${REGISTRY_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+  renameSync(tmp, REGISTRY_PATH);
+}
+
+// --- Sidebar groups (local-first sync) ---
+// The web UI and the macOS app each keep their own local copy of the sidebar
+// group/order state and opportunistically sync it here so the two surfaces
+// converge. Clients stay usable offline; this server copy is just the meeting
+// point. Last write wins by `updatedAt` (ms epoch).
+const SIDEBAR_GROUPS_PATH = join(LOG_DIR, "sidebar-groups.json");
+
+function loadSidebarGroups() {
+  try {
+    const parsed = JSON.parse(readFileSync(SIDEBAR_GROUPS_PATH, "utf8"));
+    return parsed && parsed.data && typeof parsed.data === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveSidebarGroups(entry) {
+  const tmp = `${SIDEBAR_GROUPS_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(entry, null, 2), "utf8");
+  renameSync(tmp, SIDEBAR_GROUPS_PATH);
+}
+
+// --- Event-derived status ---------------------------------------------------
+// Adapters POST canonical lifecycle events (see agent-events.js). The reducer's
+// output is stored per session — keyed by tmux session name (registry
+// identity) with a pane-id alias so read sites can look up either form — and
+// overrides screen detection while fresh.
+const eventStates = new Map(); // session name or pane id → { status, updatedAt }
+const surfaceTokens = new Map(); // surface token → session name (minted at pane launch)
+// Session name → launch spec. The spec is token-free, so it is safe to
+// persist in the registry and re-render after a restart.
+const launchSpecs = new Map();
+const terminalClients = new Set(); // connected /ws/terminal sockets, for status push
+
+function getEventState(key) {
+  return eventStates.get(key) || null;
+}
+
+function setEventState(name, paneId, state) {
+  eventStates.set(name, state);
+  eventStates.set(paneId, state);
+}
+
+// Effective status for a session: fresh event state wins, else screen.
+function effectiveStatus(paneKey, sessionName, content) {
+  const state = getEventState(paneKey)
+    || (sessionName ? getEventState(sessionName) : null);
+  const fromEvent = eventStatus(state, Date.now(), EVENT_TTL_MS);
+  if (fromEvent) return { status: fromEvent, source: "event" };
+  if (!content) return { status: "unknown", source: "screen" };
+  return {
+    status: detectStatusFromScreen(content, recentOutput(paneKey, content)),
+    source: "screen",
+  };
+}
+
+function broadcastStatus(payload) {
+  const msg = JSON.stringify(payload);
+  for (const ws of terminalClients) {
+    if (ws.readyState === 1) ws.send(msg);
+  }
+}
+
+// Pane id -> { pid, sessionId } for every live Claude Code process. A missing
+// directory is normal (Claude Code may never have run); a torn file is skipped.
+async function loadClaudeSessions() {
+  let names;
+  try {
+    names = await readdir(CLAUDE_SESSIONS_DIR);
+  } catch {
+    return new Map();
+  }
+  const records = [];
+  for (const name of names) {
+    if (!name.endsWith(".json")) continue; // <pid>.<hash>.key files live here too
+    try {
+      records.push(JSON.parse(await readFile(join(CLAUDE_SESSIONS_DIR, name), "utf8")));
+    } catch { /* torn or rotated */ }
+  }
+  return indexClaudeSessions(records);
+}
+
+// Best-effort discovery: every tmux pane, with a session id where the agent
+// exposes one. Never throws — an empty set is just "nothing to record now".
+async function discoverManagedSessions() {
+  const SEP = "|||";
+  let paneOutput = "";
+  try {
+    paneOutput = await tmux(
+      "list-panes", "-a", "-F",
+      `#{session_name}${SEP}#{pane_id}${SEP}#{pane_pid}${SEP}#{pane_current_command}${SEP}#{pane_current_path}`,
+    );
+  } catch {
+    return [];
+  }
+  const claudeSessions = await loadClaudeSessions();
+  const out = [];
+  for (const line of paneOutput.split("\n").filter(Boolean)) {
+    const [name, paneId, panePidRaw, currentCmd, panePath] = line.split(SEP);
+    if (!name || name.startsWith("_ah_")) continue;
+    const panePid = parseInt(panePidRaw, 10) || null;
+    let agent = null;
+    try {
+      const content = await tmux("capture-pane", "-t", paneId, "-p", "-J").catch(() => "");
+      agent = panePid ? await detectAgent(panePid, currentCmd, content) : null;
+    } catch { /* ignore */ }
+    // Every pane is tracked — not just agent ones. An unclassified or shell
+    // pane stays in the restore set and is recreated as a bare shell at boot;
+    // only panes whose agent exposes a conversation pay for the id probe.
+    let sessionId = null;
+    if (agent === "opencode" && panePid) {
+      sessionId = await resolvePaneSessionId(panePid);
+    } else if (agent === "Claude Code" && panePid) {
+      const recorded = claudeSessions.get(paneId);
+      // A <pid>.json from a previous boot can name a pane id that tmux has
+      // since reused. Only trust it while that pid is actually inside this
+      // pane's process tree.
+      if (recorded && (await paneProcesses(panePid)).includes(recorded.pid)) {
+        sessionId = recorded.sessionId;
+      }
+    }
+      out.push({ name, dir: panePath || null, sessionId, agent, launch: launchSpecs.get(name) ?? null });
+  }
+  return out;
+}
+
+// The pane's process plus its descendants.
+async function paneProcesses(panePid) {
+  const seen = new Set();
+  const queue = [panePid];
+  const pids = [];
+  while (queue.length > 0) {
+    const ppid = queue.shift();
+    if (!ppid || seen.has(ppid)) continue;
+    seen.add(ppid);
+    pids.push(ppid);
+    try {
+      const { stdout } = await execFileAsync("pgrep", ["-lP", String(ppid)], { timeout: 2000 });
+      for (const line of stdout.trim().split("\n").filter(Boolean)) {
+        const pid = parseInt(line.trim().split(/\s+/)[0], 10);
+        if (pid) queue.push(pid);
+      }
+    } catch { /* leaf */ }
+  }
+  return pids;
+}
+
+function parseSessionFlags(args) {
+  const m = args.match(/--session[=\s]+(ses_[A-Za-z0-9]+)|(?:^|\s)-s\s+(ses_[A-Za-z0-9]+)/);
+  const sessionId = (m && (m[1] || m[2])) || null;
+  const p = args.match(/--port[=\s]*(\d+)/);
+  return { sessionId, port: p ? parseInt(p[1], 10) : null };
+}
+
+// An opencode session id looks like `ses_<alphanumerics>`. The id reaches a
+// shell command when a session is restored, so its shape is checked rather
+// than trusted — it can also arrive from the opencode server's own response.
+const OPENCODE_SESSION_ID_RE = /^ses_[A-Za-z0-9]+$/;
+
+function isOpencodeSessionId(value) {
+  return typeof value === "string" && OPENCODE_SESSION_ID_RE.test(value);
+}
+
+// Which opencode session is this pane's TUI on? Prefer an explicit
+// -s/--session flag in the process argv; otherwise ask the pane's opencode
+// server which session it is serving.
+async function resolvePaneSessionId(panePid) {
+  const opencodeProcs = [];
+  for (const pid of await paneProcesses(panePid)) {
+    try {
+      const { stdout } = await execFileAsync("ps", ["-o", "args=", "-p", String(pid)], { timeout: 1000 });
+      const args = stdout.trim();
+      if (/\bopencode\b/.test(args) && !/tmux/.test(args)) opencodeProcs.push(args);
+    } catch { /* ignore */ }
+  }
+  let port = null;
+  for (const args of opencodeProcs) {
+    const flags = parseSessionFlags(args);
+    if (flags.sessionId) return flags.sessionId;
+    if (flags.port) port = flags.port;
+  }
+  if (opencodeProcs.length === 0) return null;
+  const targetPort = port || 4096;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const res = await fetch(`http://127.0.0.1:${targetPort}/session/status`, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const status = await res.json();
+    const keys = Object.keys(status || {});
+    if (keys.length === 1) return isOpencodeSessionId(keys[0]) ? keys[0] : null;
+    const busy = keys.filter((k) => status[k]?.type === "busy");
+    return busy.length === 1 && isOpencodeSessionId(busy[0]) ? busy[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+async function maintainRegistry() {
+  const live = await discoverManagedSessions();
+  const now = new Date().toISOString();
+  const { registry, changed, removed } = reconcileRegistry(live, registryCache.registry, now);
+  registryCache.registry = registry;
+  if (!changed) return;
+  saveRegistry(registry);
+  log("INFO", "Active session registry updated", { sessions: registry.sessions.length, removed: removed.length });
+  for (const r of removed) log("INFO", "Registry prune", r);
+  if (registry.sessions.length > 0) {
+    log("INFO", "Registry contents", registry.sessions.map((s) => {
+      const resumable = s.agent === "opencode" || s.agent === "Claude Code";
+      const label = resumable && s.sessionId
+        ? `resume ${s.sessionId.slice(0, 24)}`
+        : s.agent === "opencode"
+          ? "no-session-id (will resume -c)"
+          : s.agent === "Claude Code"
+            ? "no-session-id (will launch claude)"
+            : `recreate-shell (${s.agent || "unclassified"})`;
+      return `${s.tmux} → ${label}`;
+    }));
+  }
+}
+
+// An opencode session id is resolvable if the binary knows the session. This
+// is the probe that decides between `-s <id>` and the degraded `-c`.
+async function isSessionResolvable(sessionId) {
+  try {
+    await execFileAsync(OPENCODE_BIN, ["export", sessionId, "--sanitize"], {
+      timeout: 60000,
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// A Claude session id is resolvable while its transcript still exists.
+// Claude stores one .jsonl per conversation under a slugified-cwd project dir.
+async function hasClaudeTranscript(sessionId) {
+  let entries;
+  try {
+    entries = await readdir(CLAUDE_PROJECTS_DIR, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      await access(join(CLAUDE_PROJECTS_DIR, entry.name, `${sessionId}.jsonl`));
+      return true;
+    } catch { /* not in this project dir */ }
+  }
+  return false;
+}
+
+async function executeRestoreAction(action) {
+  // Same surface-token binding as POST /api/sessions, so a restored pane is
+  // identifiable to its adapter too.
+  const token = newSurfaceToken();
+  surfaceTokens.set(token, action.name);
+  const launch = { name: action.name, dir: action.dir, token };
+  if (action.kind === "relaunch-command") {
+    // The pane is defined by its launch spec, not by an agent on this machine.
+    // Re-resolve the target so a changed host or identity takes effect.
+    const config = await resolveConfig();
+    const rendered = renderLaunchCommand(action.launch, { targets: config.targets, token });
+    if (!rendered.ok) {
+      log("ERROR", "Restore failed", { name: action.name, error: rendered.error });
+      return;
+    }
+    launchSpecs.set(action.name, action.launch);
+    try {
+      await launchPane({ ...launch, command: rendered.command, timeoutMs: 15000 });
+      log("INFO", "Restored launch-command session", {
+        name: action.name,
+        mode: "relaunch-command",
+        dir: action.dir || null,
+      });
+    } catch (err) {
+      log("ERROR", "Restore failed", { name: action.name, error: redactTokens(err.message) });
+    }
+    return;
+  }
+  if (action.kind === "recreate-shell") {
+    // No command: the pane gets a plain shell in the recorded directory. The
+    // window comes back even when the process state is gone.
+    try {
+      await launchPane({ ...launch, timeoutMs: 15000 });
+      log("INFO", "Restored shell session", {
+        name: action.name,
+        mode: "recreate-shell",
+        dir: action.dir || null,
+      });
+    } catch (err) {
+      log("ERROR", "Restore failed", { name: action.name, error: redactTokens(err.message) });
+    }
+    return;
+  }
+  const isClaude = action.kind === "launch-claude";
+  // An id only reaches a shell command after the resume probe; re-check the
+  // shape anyway so a hand-edited registry can never inject argv.
+  const resumable = isClaude ? isClaudeSessionId(action.sessionId) : isOpencodeSessionId(action.sessionId);
+  let cmd;
+  if (isClaude) {
+    // No `-c` fallback: two panes in the same dir would both continue the
+    // same "most recent" conversation. A fresh session is the honest degrade.
+    cmd = resumable ? `${CLAUDE_BIN} -r ${action.sessionId}` : CLAUDE_BIN;
+  } else {
+    cmd = action.continueBest ? `${OPENCODE_BIN} -c` : `${OPENCODE_BIN} -s ${action.sessionId}`;
+  }
+  // The agent is typed into the pane's shell rather than installed as the
+  // pane's process, so the session outlives the agent: /exit leaves the
+  // shell behind instead of taking the session down with it.
+  try {
+    await launchPane({ ...launch, command: cmd, timeoutMs: 15000 });
+    log("INFO", "Restored agent session", {
+      name: action.name,
+      agent: isClaude ? "Claude Code" : "opencode",
+      mode: resumable ? "resume" : (isClaude ? "degrade" : "continue-last"),
+      sessionId: resumable ? action.sessionId.slice(0, 24) : null,
+      dir: action.dir || null,
+    });
+  } catch (err) {
+    log("ERROR", "Restore failed", { name: action.name, error: redactTokens(err.message) });
+  }
+}
+
+async function runStartupRestore() {
+  const registry = loadRegistry();
+  registryCache.registry = registry;
+  if (!registry || registry.sessions.length === 0) {
+    log("INFO", "Startup restore: no active-session registry — nothing to restore");
+    return;
+  }
+  const ids = [...new Set(registry.sessions.map((s) => s.sessionId).filter(Boolean))];
+  const resolvable = new Set();
+  for (const entry of registry.sessions) {
+    const id = entry.sessionId;
+    if (!id || resolvable.has(id)) continue;
+    const ok = entry.agent === "opencode"
+      ? await isSessionResolvable(id)
+      : entry.agent === "Claude Code"
+        ? await hasClaudeTranscript(id)
+        : false;
+    if (ok) resolvable.add(id);
+  }
+  let existingTmux = [];
+  try {
+    existingTmux = (await tmux("list-sessions", "-F", "#{session_name}")).split("\n").filter(Boolean);
+  } catch { /* no tmux */ }
+  const actions = buildRestorePlan({ registry, existingTmux, resolvable });
+  const unresolved = ids.length - resolvable.size;
+  log("INFO", "Startup restore plan", {
+    planSize: actions.length,
+    resolved: resolvable.size,
+    unresolved: unresolved > 0 ? unresolved : undefined,
+  });
+  for (const action of actions) await executeRestoreAction(action);
+  await maintainRegistry();
+}
+
+app.get("/api/registry", (_req, res) => {
+  res.json(registryCache.registry || { version: REGISTRY_VERSION, updatedAt: null, sessions: [] });
+});
+
+// Sidebar group/order sync (local-first; clients keep their own copy too)
+app.get("/api/sidebar-groups", (_req, res) => {
+  res.json(loadSidebarGroups() || { data: null, updatedAt: 0 });
+});
+
+app.post("/api/sidebar-groups", (req, res) => {
+  const body = req.body;
+  if (!body || typeof body !== "object" || !body.data || typeof body.data !== "object") {
+    return res.status(400).json({ error: "Invalid sidebar groups payload" });
+  }
+  const updatedAt = Number.isFinite(body.updatedAt) ? body.updatedAt : 0;
+  const incoming = { data: sanitizeSidebarOrder(body.data), updatedAt };
+  const existing = loadSidebarGroups();
+  // The same rule the client uses: last write wins, except a copy without groups
+  // cannot erase a copy that has them unless it declared the erasure. Both
+  // sides resolve with pickWinner so a blank copy can never win the race.
+  const winner = existing && pickWinner(existing, incoming) === "local" ? existing : incoming;
+  if (winner === incoming) saveSidebarGroups(incoming);
+  res.json(winner);
+});
+
+// Rename a tmux session
+app.post("/api/sessions/:name/rename", async (req, res) => {
+  if (!validateTarget(res, req.params.name)) return;
+  const { newName } = req.body;
+  if (!newName || !TMUX_TARGET_RE.test(newName)) {
+    return res.status(400).json({ error: "Invalid new session name" });
+  }
+  try {
+    await tmux("rename-session", "-t", req.params.name, newName);
+    // Keep the pane's surface-token binding pointing at the new name.
+    for (const [tok, nm] of surfaceTokens) {
+      if (nm === req.params.name) surfaceTokens.set(tok, newName);
+    }
+    res.json({ ok: true, oldName: req.params.name, newName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Kill a tmux session
+app.delete("/api/sessions/:name", async (req, res) => {
+  if (!validateTarget(res, req.params.name)) return;
+  try {
+    await tmux("kill-session", "-t", req.params.name);
+    // Drop any surface tokens bound to the dead pane.
+    for (const [tok, nm] of [...surfaceTokens]) {
+      if (nm === req.params.name) surfaceTokens.delete(tok);
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get pane content (for status detection)
+app.get("/api/sessions/:target/capture", async (req, res) => {
+  if (!validateTarget(res, req.params.target)) return;
+  try {
+    const content = await tmux("capture-pane", "-t", req.params.target, "-p", "-J");
+    const { status, source } = effectiveStatus(req.params.target, null, content);
+    res.json({ content, status, source });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Accept a canonical lifecycle event from an adapter. Identity must resolve
+// (surface token → registry session id) or the event is rejected unmatched;
+// unknown event names are accepted as no-ops. A fresh event-derived status
+// then overrides screen detection until it goes stale.
+app.post("/api/events", async (req, res) => {
+  const { event, sessionId, surfaceToken } = req.body || {};
+  const malformed =
+    typeof event !== "string" || !event ||
+    (sessionId !== undefined && (typeof sessionId !== "string" || !sessionId)) ||
+    (surfaceToken !== undefined && (typeof surfaceToken !== "string" || !surfaceToken));
+  if (malformed) {
+    return res.status(400).json({ error: "Malformed event payload" });
+  }
+
+  const identity = resolveIdentity(
+    { surfaceToken, sessionId },
+    {
+      surfaceTokens,
+      registrySessions: registryCache.registry?.sessions || [],
+    },
+  );
+  if (!identity.ok) {
+    return res.status(422).json({ error: "Unmatched", reason: identity.reason });
+  }
+  const name = identity.name;
+  if (!TMUX_TARGET_RE.test(name)) {
+    return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
+  }
+
+  // Map the registry's session name to a live pane id (the key used by
+  // screen detection and the terminal websockets).
+  let paneId = null;
+  try {
+    const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
+    paneId = out.split("\n")[0]?.trim() || null;
+  } catch { /* session gone — treated as unmatched below */ }
+  if (!paneId) {
+    return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
+  }
+
+  const prev = getEventState(name) || getEventState(paneId);
+  const next = applyEvent(prev, event, Date.now());
+  if (next) setEventState(name, paneId, next);
+
+  const known = EVENT_TYPES.includes(event);
+  const status = eventStatus(next, Date.now(), EVENT_TTL_MS);
+  if (status) {
+    broadcastStatus({ type: "status", target: paneId, name, status, source: "event" });
+  }
+  log("INFO", "Status event", { name, paneId, event, known, status, changed: (prev?.status ?? null) !== (next?.status ?? null) });
+  res.json({
+    ok: true,
+    target: paneId,
+    name,
+    event,
+    known,
+    status,
+    source: status ? "event" : null,
+    changed: (prev?.status ?? null) !== (next?.status ?? null),
+  });
+});
+
+// Enrichment: read Claude session metadata
+app.get("/api/claude-sessions", async (_req, res) => {
+  try {
+    const meta = await readClaudeSessionMeta();
+    res.json(meta);
+  } catch {
+    res.json({});
+  }
+});
+
+// --- WebSocket Terminal ---
+// Uses node-pty (beta) for proper PTY allocation
+import pty from "node-pty";
+
+// A claim is answered as soon as the tmux client behind the PTY is
+// registered. It registers a moment after the PTY is spawned, so the search
+// is repeated for a short while before the claim is given up on.
+const CLAIM_RETRY_MS = 200;
+const CLAIM_ATTEMPTS = 25;
+
+// The lease on each session's shared pane: the one connection that is allowed
+// to move it. Keyed by tmux target, because the pane belongs to the session.
+// A device that attaches - a second tab, a phone that wakes up - takes the
+// pane away from the device the user is looking at, and the pane keeps that
+// size until somebody re-asserts. The lease says who may re-assert.
+const paneLeases = new Map();
+let connectionCounter = 0;
+
+/** The lease for a target, created the first time it is asked for. */
+function leaseFor(target) {
+  let lease = paneLeases.get(target);
+  if (!lease) {
+    lease = createLease();
+    paneLeases.set(target, lease);
+  }
+  return lease;
+}
+
+app.ws("/ws/terminal/:target", (ws, req) => {
+  const target = req.params.target;
+  log("INFO", "WS connect", { target, remoteAddr: req.ip });
+
+  // The client's first frame is its resize, and that frame is the only thing
+  // that tells us how big to make the PTY. It can arrive before the origin
+  // check below has finished, so the message listener is attached
+  // synchronously and every frame goes into an inbox until the handler is
+  // ready. A frame that arrives while no listener is attached is dropped by
+  // the socket for good, and a dropped resize means a PTY that is never
+  // spawned — a terminal that stays black until the user hits reconnect.
+  const inbox = createInbox();
+  let ptyProcess = null;
+  let heartbeat = null;
+
+  // Strip TMUX env var so tmux attach works when server runs inside tmux
+  const cleanEnv = { ...process.env, TERM: "xterm-256color", LANG: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" };
+  delete cleanEnv.TMUX;
+  delete cleanEnv.TMUX_PANE;
+
+  // Frames that arrived before the PTY existed. They are replayed once it
+  // does, so nothing typed in the gap is lost.
+  let pendingMessages = [];
+
+  // A claim asks tmux to give the shared window to this client. The tmux
+  // client shows up in `list-clients` a moment after the PTY is spawned, so
+  // the first attempts can miss it and are repeated for a short while.
+  let claimInFlight = false;
+  let claimQueued = false;
+  let ptyExited = false;
+
+  // This connection's name in the lease, and the server-clock time of the
+  // last time the user touched the page on this device. The server stamps
+  // the time, so two devices never have to agree on a clock.
+  const connectionId = `${target}#${++connectionCounter}`;
+  let interactedAt = null;
+
+  function spawnPty(cols, rows) {
+    try {
+      ptyProcess = pty.spawn(TMUX, ["attach-session", "-t", target], {
+        name: "xterm-256color",
+        cols: cols || 80,
+        rows: rows || 24,
+        cwd: os.homedir(),
+        env: cleanEnv,
+      });
+    } catch (err) {
+      log("ERROR", "Terminal spawn error", { target, error: err.message });
+      recordSpawnError(err);
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "error", message: err.message }));
+        ws.close();
+      }
+      return;
+    }
+
+    ptyProcess.onData((data) => {
+      if (ws.readyState === 1) {
+        ws.send(JSON.stringify({ type: "output", data }));
+      }
+    });
+
+    ptyProcess.onExit(({ exitCode }) => {
+        ptyExited = true;
+        if (ws.readyState === 1) {
+          ws.send(JSON.stringify({ type: "exit", code: exitCode }));
+          ws.close();
+        }
+    });
+
+    // Flush any messages that arrived before PTY was ready
+    for (const msg of pendingMessages) {
+      handleMessage(msg);
+    }
+    pendingMessages = [];
+  }
+
+  // The tmux client behind this PTY, or null when it is not registered yet.
+  async function findOwnClient() {
+    if (!ptyProcess || ptyExited) return null;
+    const output = await tmux(...buildListClientsArgs(target));
+    return findClientByPid(parseClientList(output), ptyProcess.pid);
+  }
+
+  // Ask tmux to give the shared window to this client.
+  //
+  // tmux sizes a session's window from the client whose size last changed, so
+  // a device that comes back to the size it already had never gets the window
+  // back on its own - it has to ask for it. `switch-client` makes this client
+  // the session's current one, and the window takes its size.
+  async function claimWindow() {
+    if (claimInFlight) {
+      claimQueued = true;
+      return;
+    }
+    claimInFlight = true;
+    try {
+      for (let attempt = 1; attempt <= CLAIM_ATTEMPTS; attempt++) {
+        const client = await findOwnClient();
+        if (client) {
+          await tmux(...buildSwitchClientArgs(client.name, client.windowId));
+          return;
+        }
+        if (ptyExited) return;
+        await new Promise((resolve) => setTimeout(resolve, CLAIM_RETRY_MS));
+      }
+      log("WARN", "No tmux client to claim the window for", { target });
+    } catch (err) {
+      log("WARN", "Claiming the tmux window failed", { target, error: err.message });
+    } finally {
+      claimInFlight = false;
+      if (claimQueued) {
+        claimQueued = false;
+        claimWindow();
+      }
+    }
+  }
+
+
+  // The pane belongs to whoever holds the lease.
+  //
+  // Another device - a second tab, a phone that wakes up - can take the pane
+  // in tmux without asking, because a client that changes its size takes the
+  // pane with it. The lease says who may ask for it back.
+  function holdsPane() {
+    const lease = paneLeases.get(target);
+    return !lease || !lease.holder || lease.holder === connectionId;
+  }
+
+  // Ask for the session's shared pane, and take it when the lease allows.
+  //
+  // A touch means the user has just used this device, so it wins the pane
+  // from whatever device was holding it. A plain claim is a heartbeat: it
+  // keeps the pane as long as no other device has been touched more
+  // recently.
+  function claimPane(touch, size) {
+    if (touch) interactedAt = Date.now();
+    const lease = leaseFor(target);
+    const previousHolder = lease.holder;
+    const result = requestLease(lease, { holder: connectionId, interactedAt }, Date.now());
+    paneLeases.set(target, result.lease);
+    if (!result.granted) {
+      // The terminal still has to exist on this device, but its size must not
+      // change: in tmux a client that changes its size takes the pane.
+      if (!ptyProcess) spawnPty(size.cols, size.rows);
+      return false;
+    }
+    if (previousHolder !== result.lease.holder) {
+      log("INFO", "The tmux pane belongs to", { target, holder: result.lease.holder });
+    }
+    applySize(size);
+    claimWindow();
+    return true;
+  }
+
+  function applySize(size) {
+    if (ptyProcess) ptyProcess.resize(size.cols, size.rows);
+    else spawnPty(size.cols, size.rows);
+  }
+
+  function handleMessage(msg) {
+    try {
+      const parsed = JSON.parse(msg);
+      if (parsed.type === "input") {
+        if (ptyProcess) {
+          ptyProcess.write(parsed.data);
+        }
+      } else if (parsed.type === "resize" || parsed.type === CLAIM_FRAME_TYPE) {
+        // A size the PTY cannot take is not worth acting on: node-pty throws
+        // on cols/rows <= 0, and the catch below would write the raw frame
+        // into the terminal.
+        const size = readSize(parsed);
+        if (!size) return;
+        if (parsed.type === CLAIM_FRAME_TYPE) {
+          claimPane(parsed.touch === true, size);
+        } else if (holdsPane()) {
+          // In tmux a client that changes its size takes the shared pane, so
+          // only the device that holds the pane may change its size.
+          applySize(size);
+        }
+      }
+    } catch {
+      if (ptyProcess) ptyProcess.write(msg.toString());
+    }
+  }
+
+  // One path for every frame, whether it arrives now or is replayed later.
+  function receiveFrame(str) {
+    if (ptyProcess) {
+      handleMessage(str);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(str);
+      if (parsed.type === "resize" || parsed.type === CLAIM_FRAME_TYPE) {
+        const size = readSize(parsed);
+        if (size) {
+          if (parsed.type === CLAIM_FRAME_TYPE) {
+            claimPane(parsed.touch === true, size);
+          } else {
+            spawnPty(size.cols, size.rows);
+          }
+        }
+        return;
+      }
+    } catch { /* not JSON */ }
+    pendingMessages.push(str);
+  }
+
+  // Attached before anything is awaited, so no frame can be lost.
+  ws.on("message", (msg) => {
+    const str = msg.toString();
+    if (inbox.offer(str)) receiveFrame(str);
+  });
+
+  ws.on("close", (code, reason) => {
+    if (heartbeat) clearInterval(heartbeat);
+    terminalClients.delete(ws);
+    log("INFO", "WS disconnect", { target, code, reason: reason?.toString() });
+    // A device that is gone must not keep the lease: the pane goes to
+    // whoever asks for it next.
+    const lease = paneLeases.get(target);
+    if (lease) paneLeases.set(target, releaseLease(lease, connectionId));
+    if (ptyProcess) {
+      // Detach cleanly instead of killing the tmux session
+      try { ptyProcess.write("\x02d"); } catch { /* ignore */ }
+      setTimeout(() => {
+        try { ptyProcess.kill(); } catch { /* ignore */ }
+      }, 500);
+    }
+  });
+
+  (async () => {
+    if (!await isAllowedRequestOrigin(req)) {
+      log("WARN", "WS refused: origin not allowed", { target, origin: req.headers.origin });
+      ws.close();
+      return;
+    }
+
+    if (!TMUX_TARGET_RE.test(target)) {
+      ws.send(JSON.stringify({ type: "error", message: "Invalid session target" }));
+      ws.close();
+      return;
+    }
+    // The client may already be gone — it opened, sent its resize and left
+    // while the origin check was running.
+    if (ws.readyState !== 1) return;
+    terminalClients.add(ws);
+
+    // Heartbeat: server pings every 30s, terminates if no pong within 10s
+    let alive = true;
+    heartbeat = setInterval(() => {
+      if (!alive) {
+        log("WARN", "WS pong timeout, terminating", { target });
+        clearInterval(heartbeat);
+        ws.terminate();
+        return;
+      }
+      alive = false;
+      ws.ping();
+    }, 30_000);
+    ws.on("pong", () => { alive = true; });
+
+    // Replay whatever arrived while the checks were running. The first frame
+    // is usually the resize, which is what spawns the PTY.
+    for (const msg of inbox.open()) {
+      receiveFrame(msg);
+    }
+
+    // Belt and braces: a client that never sends a resize would otherwise
+    // leave the pane attached to nothing, and black, for good.
+    setTimeout(() => {
+      if (!ptyProcess && ws.readyState === 1) {
+        spawnPty(80, 24);
+      }
+    }, 3000).unref();
+  })();
+});
+
+// --- Agent Detection ---
+function detectAgentFromCommand(command) {
+  if (!command) return null;
+  const normalized = command.trim().toLowerCase();
+  if (normalized === "opencode") return "opencode";
+  if (normalized === "codex") return "Codex";
+  if (normalized === "claude") return "Claude Code";
+  if (normalized === "cursor") return "Cursor";
+  if (normalized === "aider") return "Aider";
+  if (normalized === "copilot") return "Copilot";
+  return null;
+}
+
+function detectAgentFromArgs(args) {
+  if (!args) return null;
+  const normalized = args.trim().toLowerCase();
+  // opencode must come before claude: `opencode --model claude-...` would
+  // otherwise match the claude substring check.
+  if (normalized.includes("opencode")) return "opencode";
+  if (normalized.includes("codex")) return "Codex";
+  if (normalized.includes("claude")) return "Claude Code";
+  if (normalized.includes("cursor")) return "Cursor";
+  if (normalized.includes("aider")) return "Aider";
+  if (normalized.includes("copilot")) return "Copilot";
+  return null;
+}
+
+function detectAgentFromContent(content) {
+  if (!content) return null;
+  const normalized = content.toLowerCase();
+
+  // Check opencode before claude: opencode's UI shows the Anthropic provider
+  // and model name when using Claude models, which would otherwise win.
+  if (normalized.includes("opencode")) return "opencode";
+  if (normalized.includes("openai codex")) return "Codex";
+  if (normalized.includes("anthropic claude")) return "Claude Code";
+  if (normalized.includes("cursor")) return "Cursor";
+  if (normalized.includes("aider")) return "Aider";
+  if (normalized.includes("copilot")) return "Copilot";
+
+  return null;
+}
+
+// Identifies what agent/tool is running in a tmux pane by inspecting
+// the pane command, process tree rooted at the pane's shell PID, and
+// finally the captured pane content for TUI-only fingerprints.
+async function detectAgent(panePid, currentCmd, content = "") {
+  const directMatch = detectAgentFromCommand(currentCmd);
+  if (directMatch) return directMatch;
+  if (!panePid) return detectAgentFromContent(content) || "shell";
+  try {
+    const pending = [panePid];
+    const visited = new Set();
+
+    while (pending.length > 0) {
+      const parentPid = pending.shift();
+      if (!parentPid || visited.has(parentPid)) continue;
+      visited.add(parentPid);
+
+      let children = [];
+      try {
+        const { stdout } = await execFileAsync("pgrep", ["-lP", parentPid], { timeout: 2000 });
+        children = stdout.trim().split("\n").filter(Boolean);
+      } catch {
+        continue;
+      }
+
+      for (const child of children) {
+        const parts = child.trim().split(/\s+/);
+        if (parts.length < 2) continue;
+        const [childPid, childName] = parts;
+        pending.push(childPid);
+
+        const nameMatch = detectAgentFromCommand(childName);
+        if (nameMatch) return nameMatch;
+
+        try {
+          const { stdout: args } = await execFileAsync("ps", ["-o", "args=", "-p", childPid], { timeout: 1000 });
+          const argsMatch = detectAgentFromArgs(args);
+          if (argsMatch) return argsMatch;
+        } catch { /* ignore */ }
+
+        // Claude Code sometimes shows its version as the process name (e.g. "2.1.77")
+        if (!/^\d+\.\d+\.\d+$/.test(childName)) continue;
+        try {
+          const { stdout: comm } = await execFileAsync("ps", ["-o", "comm=", "-p", childPid], { timeout: 1000 });
+          if (comm.trim() === "claude") return "Claude Code";
+        } catch { /* ignore */ }
+      }
+    }
+
+    return detectAgentFromContent(content) || "shell";
+  } catch {
+    return detectAgentFromContent(content) || "shell";
+  }
+}
+
+// --- Session Discovery ---
+async function discoverSessions() {
+  // Get all tmux sessions and panes
+  let paneOutput;
+  try {
+    const SEP = "|||";
+    paneOutput = await tmux(
+      "list-panes", "-a", "-F",
+      `#{session_name}${SEP}#{session_group}${SEP}#{pane_id}${SEP}#{pane_tty}${SEP}#{pane_current_command}${SEP}#{window_name}${SEP}#{session_activity}${SEP}#{pane_pid}`
+    );
+  } catch {
+    return [];
+  }
+
+  const lines = paneOutput.split("\n").filter(Boolean);
+  const seen = new Set();
+  const entries = [];
+
+  for (const line of lines) {
+    const [sessionName, sessionGroup, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid] = line.split("|||");
+
+    if (sessionName.startsWith("_ah_")) continue;
+
+    const groupKey = sessionGroup || sessionName;
+    if (seen.has(groupKey)) continue;
+    seen.add(groupKey);
+
+    entries.push({
+      sessionName, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid
+    });
+  }
+
+  const sessions = await Promise.all(entries.map(async (e) => {
+    let status = "unknown";
+    let statusSource = "screen";
+    let agent = "shell";
+    try {
+      const content = await tmux("capture-pane", "-t", e.paneId, "-p", "-J").catch(() => "");
+      const detectedAgent = await detectAgent(e.panePid, e.currentCmd, content);
+      const eff = effectiveStatus(e.paneId, e.sessionName, content);
+      status = eff.status;
+      statusSource = eff.source;
+      agent = detectedAgent;
+    } catch { /* ignore */ }
+
+    return {
+      name: e.sessionName,
+      paneId: e.paneId,
+      tty: e.paneTty,
+      currentCommand: e.currentCmd,
+      windowName: e.windowName,
+      status,
+      source: statusSource,
+      agent,
+      lastActivity: parseInt(e.sessionActivity, 10) || 0,
+    };
+  }));
+
+  // Enrich with Claude session metadata
+  const meta = await readClaudeSessionMeta();
+  for (const session of sessions) {
+    const enrichment = meta[session.name];
+    if (enrichment) {
+      session.projectPath = enrichment.projectPath;
+      session.summary = enrichment.summary;
+    }
+  }
+
+  // Sort: needsInput first, then working, then idle, then ended, then unknown
+  const priority = { needsInput: 0, working: 1, idle: 2, ended: 3, unknown: 4 };
+  sessions.sort((a, b) => {
+    const pa = priority[a.status] ?? 4;
+    const pb = priority[b.status] ?? 4;
+    if (pa !== pb) return pa - pb;
+    // Within same priority, sort by most recent activity first
+    return (b.lastActivity || 0) - (a.lastActivity || 0);
+  });
+
+  return sessions;
+}
+
+// --- Pane output activity -------------------------------------------------
+// detectStatusFromScreen needs to know whether a pane is still producing
+// output: a quiet pane with no visible prompt is at rest (or hung), while a
+// pane whose capture text keeps changing is working. Fingerprints are kept
+// per target across polls. The first sighting counts as recent, so a freshly
+// discovered session never reads as idle before we have any history.
+const outputState = new Map();
+
+function recentOutput(target, content) {
+  const now = Date.now();
+  const prev = outputState.get(target);
+  if (!prev || prev.fingerprint !== content) {
+    outputState.set(target, { fingerprint: content, changedAt: now });
+    return true;
+  }
+  return now - prev.changedAt < QUIET_MS;
+}
+
+async function readClaudeSessionMeta() {
+  const meta = {};
+  const claudeDir = join(os.homedir(), ".claude", "projects");
+  try {
+    const projects = await readdir(claudeDir, { withFileTypes: true });
+    for (const proj of projects) {
+      if (!proj.isDirectory()) continue;
+      try {
+        const indexPath = join(claudeDir, proj.name, "sessions-index.json");
+        const raw = await readFile(indexPath, "utf8");
+        const index = JSON.parse(raw);
+        for (const [sessionId, entry] of Object.entries(index)) {
+          if (entry.session_name) {
+            meta[entry.session_name] = {
+              projectPath: entry.project_path || proj.name,
+              summary: entry.summary || "",
+              sessionId,
+            };
+          }
+        }
+      } catch { /* skip */ }
+    }
+  } catch { /* skip */ }
+  return meta;
+}
+
+// --- Mesh API Routes ---
+
+// Machine identity
+app.get("/api/identity", async (_req, res) => {
+  const config = await resolveConfig();
+  res.json({
+    name: config.name,
+    peers: config.peers.map((p) => ({ name: p.name, host: p.host, port: p.port || PORT })),
+  });
+});
+
+// Aggregated sessions from all mesh peers
+app.get("/api/mesh/sessions", async (_req, res) => {
+  try {
+    const config = await resolveConfig();
+    const localSessions = await discoverSessions();
+    const result = await fetchAllMeshSessions(localSessions, config);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Force-refresh mesh discovery (clears cache, re-probes all peers)
+app.post("/api/mesh/refresh", async (_req, res) => {
+  try {
+    clearDiscoveryCache();
+    const config = await resolveConfig();
+    const localSessions = await discoverSessions();
+    const result = await fetchAllMeshSessions(localSessions, config);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Proxy: capture pane from a peer
+app.get("/api/proxy/:peerHost/sessions/:target/capture", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const url = `http://${req.params.peerHost}/api/sessions/${encodeURIComponent(req.params.target)}/capture`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const peerRes = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    const data = await peerRes.json();
+    res.json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
+
+// Proxy: create session on a peer
+app.post("/api/proxy/:peerHost/sessions", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const url = `http://${req.params.peerHost}/api/sessions`;
+    const peerRes = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    const data = await peerRes.json();
+    res.status(peerRes.status).json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
+
+// Proxy: delete session on a peer
+app.delete("/api/proxy/:peerHost/sessions/:name", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const url = `http://${req.params.peerHost}/api/sessions/${encodeURIComponent(req.params.name)}`;
+    const peerRes = await fetch(url, { method: "DELETE" });
+    const data = await peerRes.json();
+    res.status(peerRes.status).json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
+
+// Proxy: rename session on a peer
+app.post("/api/proxy/:peerHost/sessions/:name/rename", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const url = `http://${req.params.peerHost}/api/sessions/${encodeURIComponent(req.params.name)}/rename`;
+    const peerRes = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req.body),
+    });
+    const data = await peerRes.json();
+    res.status(peerRes.status).json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
+
+// WebSocket proxy: terminal on a peer machine
+app.ws("/ws/proxy/:peerHost/:target", (clientWs, req) => {
+  const peerHost = req.params.peerHost;
+  const target = req.params.target;
+  log("INFO", "WS proxy connect", { peer: peerHost, target, remoteAddr: req.ip });
+
+  // Same reason as the local terminal: the listener is attached before
+  // anything is awaited, so the client's first frame cannot be dropped.
+  const inbox = createInbox();
+  const buffered = [];
+  const MAX_BUFFER = 64;
+  let remoteOpen = false;
+  let remoteWs = null;
+  let proxyHeartbeat = null;
+
+  function forward(str) {
+    if (remoteOpen && remoteWs && remoteWs.readyState === 1) {
+      remoteWs.send(str);
+    } else if (!remoteOpen && buffered.length < MAX_BUFFER) {
+      buffered.push(str);
+    }
+  }
+
+  clientWs.on("message", (msg) => {
+    const str = msg.toString();
+    if (inbox.offer(str)) forward(str);
+  });
+
+  clientWs.on("close", (code, reason) => {
+    if (proxyHeartbeat) clearInterval(proxyHeartbeat);
+    log("INFO", "WS proxy disconnect", { peer: peerHost, target, code, reason: reason?.toString() });
+    if (remoteWs && remoteWs.readyState === 1) {
+      remoteWs.close();
+    }
+  });
+
+  (async () => {
+    const config = await resolveConfig();
+
+    if (!await isAllowedRequestOrigin(req)) {
+      log("WARN", "WS proxy refused: origin not allowed", { peer: peerHost, origin: req.headers.origin });
+      clientWs.close();
+      return;
+    }
+
+    if (!PEER_HOST_RE.test(peerHost) || !config.peers.some((p) => `${p.host}:${p.port || PORT}` === peerHost)) {
+      clientWs.send(JSON.stringify({ type: "error", message: "Invalid or unauthorized peer" }));
+      clientWs.close();
+      return;
+    }
+
+    // Heartbeat on client-facing side of the proxy
+    let proxyAlive = true;
+    proxyHeartbeat = setInterval(() => {
+      if (!proxyAlive) {
+        log("WARN", "WS proxy pong timeout", { peer: peerHost, target });
+        clearInterval(proxyHeartbeat);
+        clientWs.terminate();
+        return;
+      }
+      proxyAlive = false;
+      clientWs.ping();
+    }, 30_000);
+    clientWs.on("pong", () => { proxyAlive = true; });
+
+    const remoteUrl = `ws://${peerHost}/ws/terminal/${encodeURIComponent(target)}`;
+    try {
+      remoteWs = new WebSocket(remoteUrl, { handshakeTimeout: 5000 });
+    } catch {
+      clientWs.send(JSON.stringify({ type: "error", message: "Failed to connect to peer" }));
+      clientWs.close();
+      return;
+    }
+
+    remoteWs.on("open", () => {
+      remoteOpen = true;
+      for (const msg of buffered) {
+        remoteWs.send(msg);
+      }
+      buffered.length = 0;
+    });
+
+    remoteWs.on("message", (data) => {
+      if (clientWs.readyState === 1) {
+        clientWs.send(data.toString());
+      }
+    });
+
+    remoteWs.on("close", () => {
+      if (clientWs.readyState === 1) {
+        clientWs.close();
+      }
+    });
+
+    remoteWs.on("error", (err) => {
+      log("ERROR", "Mesh proxy remote error", { peer: peerHost, error: err.message });
+      if (clientWs.readyState === 1) {
+        clientWs.send(JSON.stringify({ type: "error", message: `Remote: ${err.message}` }));
+        clientWs.close();
+      }
+    });
+
+    // Replay whatever the client sent while the checks were running.
+    for (const msg of inbox.open()) {
+      forward(msg);
+    }
+  })();
+});
+
+// --- Health & Self-Healing ---
+
+app.get("/api/health", async (_req, res) => {
+  const ptyOk = await checkPtyHealth();
+  let tmuxOk = false;
+  try { await tmux("list-sessions"); tmuxOk = true; } catch {}
+
+  res.json({
+    status: ptyOk && tmuxOk ? "ok" : "degraded",
+    ptyAllocation: ptyOk,
+    tmuxAccess: tmuxOk,
+    spawnErrors: spawnErrorWindow.length,
+    uptimeMs: process.uptime() * 1000,
+    pid: process.pid,
+  });
+});
+
+app.post("/api/health/restart", (_req, res) => {
+  res.json({ ok: true, message: "Restarting..." });
+  log("INFO", "Restart requested via /api/health/restart");
+  setTimeout(() => process.exit(0), 100);
+});
+
+// --- Start ---
+function startMaintenance() {
+  setTimeout(() => {
+    runStartupRestore().catch((err) => log("ERROR", "Startup restore failed", { error: err.message }));
+  }, RESTORE_DELAY_MS).unref();
+  // No reconcile before restore: the restore must replay the on-disk registry
+  // (recreating dead-known sessions) before the first live scan can prune
+  // entries that are momentarily absent.
+  setInterval(() => maintainRegistry().catch(() => {}), REGISTRY_POLL_MS).unref();
+}
+
+// The Apple Virtualization bridge carries traffic to the Windows VM. Only
+// connections that land on that interface are trusted from the bridge range,
+// so a Wi-Fi LAN that reuses the same addresses gains nothing from the VM's
+// trust. When no bridge is present the bridge range is simply not trusted.
+function findBridgeAddress() {
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (!/^(bridge|vmnet|vnet)/i.test(name)) continue;
+    for (const addr of addrs ?? []) {
+      if ((addr.family === "IPv4" || addr.family === 4) && !addr.internal) {
+        return addr.address;
+      }
+    }
+  }
+  return null;
+}
+
+const BRIDGE_ADDRESS = findBridgeAddress();
+
+export { app };
+if (process.env.NODE_ENV !== "test") {
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    log("INFO", `Server started on http://0.0.0.0:${PORT} (loopback, Tailscale and VM network only)`);
+    log("INFO", `Log file: ${join(LOG_DIR, "server.log")}`);
+    log("INFO", `Trusted sources: loopback, Tailscale${BRIDGE_ADDRESS ? `, VM bridge ${BRIDGE_ADDRESS}` : " (no VM bridge found)"}`);
+    startMaintenance();
+  });
+  // Refuse Wi-Fi LAN (and any other untrusted) connections before HTTP or WebSocket handling.
+  server.on("connection", (socket) => {
+    if (isTrustedConnection({
+      remoteAddress: socket.remoteAddress,
+      localAddress: socket.localAddress,
+      bridgeAddress: BRIDGE_ADDRESS,
+    })) return;
+    log("WARN", "Refused connection from untrusted address", {
+      remoteAddress: socket.remoteAddress,
+      localAddress: socket.localAddress,
+    });
+    socket.destroy();
+  });
+}
