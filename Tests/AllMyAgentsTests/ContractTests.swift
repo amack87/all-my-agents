@@ -1,0 +1,91 @@
+import Foundation
+import Testing
+@testable import AllMyAgents
+
+/// The shared contract fixture, read from `contract/sidebar-groups.json` at the
+/// repo root. The web app's `web/test/contract.test.js` reads the same file.
+///
+/// This is the anti-drift mechanism: the groups-protected merge rule was
+/// hand-ported from the web app into this one, and the hand-port quietly
+/// disagreed with the original — a blank copy could erase a grouped one. The
+/// rule now lives in one file of cases that both sides must satisfy, so the
+/// next change breaks a test on the side that was not updated.
+private struct SidebarGroupsContract: Decodable {
+    struct WinnerCase: Decodable {
+        let name: String
+        let local: SidebarOrderEntry
+        let remote: SidebarOrderEntry
+        let expected: String
+    }
+
+    struct FlagCase: Decodable {
+        let name: String
+        let data: SidebarOrderData
+        let hasGroups: Bool
+        let clearedGroups: Bool
+    }
+
+    let winnerCases: [WinnerCase]
+    let flagCases: [FlagCase]
+    let safeGroupNames: [String]
+    let unsafeGroupNames: [String]
+}
+
+private enum ContractFixture {
+    /// The repo root, from this file's path: <root>/Tests/AllMyAgentsTests/<file>.
+    static let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+
+    static let url = repoRoot.appendingPathComponent("contract/sidebar-groups.json")
+
+    static func load() throws -> SidebarGroupsContract {
+        let data = try Data(contentsOf: url)
+        return try JSONDecoder().decode(SidebarGroupsContract.self, from: data)
+    }
+}
+
+@Test func contractFixtureIsPresent() throws {
+    #expect(FileManager.default.fileExists(atPath: ContractFixture.url.path))
+}
+
+@Test func sidebarGroupsContractResolvesIdenticallyToTheWebApp() throws {
+    let contract = try ContractFixture.load()
+    #expect(!contract.winnerCases.isEmpty)
+
+    for testCase in contract.winnerCases {
+        let winner = SidebarOrder.pickWinner(local: testCase.local, remote: testCase.remote)
+        #expect(
+            winner.rawValue == testCase.expected,
+            "contract case \"\(testCase.name)\": expected \(testCase.expected), got \(winner.rawValue)"
+        )
+    }
+}
+
+@Test func sidebarGroupsContractFlagsAgree() throws {
+    let contract = try ContractFixture.load()
+    #expect(!contract.flagCases.isEmpty)
+
+    for testCase in contract.flagCases {
+        #expect(
+            SidebarOrder.hasGroups(testCase.data) == testCase.hasGroups,
+            "contract case \"\(testCase.name)\": hasGroups disagreed"
+        )
+        #expect(
+            SidebarOrder.clearedGroups(testCase.data) == testCase.clearedGroups,
+            "contract case \"\(testCase.name)\": clearedGroups disagreed"
+        )
+    }
+}
+
+@Test func sidebarGroupsContractGroupNamesAgree() throws {
+    let contract = try ContractFixture.load()
+
+    for name in contract.safeGroupNames {
+        #expect(SidebarOrder.isSafeGroupName(name), "\"\(name)\" should be a safe group name")
+    }
+    for name in contract.unsafeGroupNames {
+        #expect(!SidebarOrder.isSafeGroupName(name), "\"\(name)\" should be refused as a group name")
+    }
+}
