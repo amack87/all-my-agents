@@ -28,6 +28,7 @@ import { statusPriority } from "./public/session-status.js";
 import { readSize, CLAIM_FRAME_TYPE } from "./public/terminal-size.js";
 import { buildListClientsArgs, buildSwitchClientArgs, findClientByPid, parseClientList } from "./tmux-client.js";
 import { createLease, requestLease, releaseLease } from "./pane-lease.js";
+import { createStatusFeed } from "./status-feed.js";
 
 // --- Logging ---
 const LOG_DIR = process.env.ALL_MY_AGENTS_LOG_DIR || join(os.homedir(), ".local", "state", "all-my-agents");
@@ -313,6 +314,35 @@ function validatePeerHost(res, peerHost, config) {
     return false;
   }
   return true;
+}
+
+// --- The status feed ---
+//
+// Discovering sessions means capturing every tmux pane — one subprocess per
+// pane. Clients that want the session list used to ask over HTTP, so every
+// client paid for its own discovery pass.
+//
+// The feed is the one place that discovers. While a client is subscribed, a
+// ticker drives discovery and pushes a full snapshot to everyone; HTTP
+// requests share the same snapshot instead of starting their own. When nobody
+// is subscribed the ticker stops and an idle server costs what it always did.
+const statusFeed = createStatusFeed({
+  discover: async () => {
+    const config = await resolveConfig();
+    const localSessions = await discoverSessions();
+    const result = await fetchAllMeshSessions(localSessions, config);
+    return { sessions: result.sessions, peerStatus: result.peerStatus };
+  },
+});
+
+/**
+ * The session snapshot every client sees. While the ticker is running the
+ * snapshot is at most a second old and HTTP reads it as it is; otherwise HTTP
+ * drives discovery itself.
+ */
+async function currentSnapshot() {
+  if (statusFeed.isRunning && statusFeed.current) return statusFeed.current;
+  return statusFeed.refreshNow();
 }
 
 // --- API Routes ---
@@ -1489,9 +1519,7 @@ app.get("/api/identity", async (_req, res) => {
 // Aggregated sessions from all mesh peers
 app.get("/api/mesh/sessions", async (_req, res) => {
   try {
-    const config = await resolveConfig();
-    const localSessions = await discoverSessions();
-    const result = await fetchAllMeshSessions(localSessions, config);
+    const result = await currentSnapshot();
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1502,13 +1530,50 @@ app.get("/api/mesh/sessions", async (_req, res) => {
 app.post("/api/mesh/refresh", async (_req, res) => {
   try {
     clearDiscoveryCache();
-    const config = await resolveConfig();
-    const localSessions = await discoverSessions();
-    const result = await fetchAllMeshSessions(localSessions, config);
+    await statusFeed.refreshNow();
+    const result = await currentSnapshot();
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// --- The status push channel ---
+//
+// A client that wants to watch the session list subscribes here instead of
+// polling /api/mesh/sessions. The server pushes a full snapshot whenever one
+// of the sessions changes. Full snapshots, not deltas: a snapshot is
+// idempotent, so a dropped frame costs nothing but a repeat.
+app.ws("/ws/status", (ws, req) => {
+  log("INFO", "WS status connect", { remoteAddr: req.ip });
+
+  (async () => {
+    if (!await isAllowedRequestOrigin(req)) {
+      log("WARN", "WS refused: origin not allowed", { origin: req.headers.origin });
+      ws.close();
+      return;
+    }
+    if (ws.readyState !== 1) return;
+
+    const subscriber = {
+      send: (message) => {
+        if (ws.readyState !== 1) return;
+        ws.send(JSON.stringify(message));
+      },
+    };
+
+    // subscribe() hands the client the current snapshot straight away, so a
+    // subscriber never has to wait a whole tick to see anything.
+    await statusFeed.subscribe(subscriber);
+
+    ws.on("close", () => {
+      log("INFO", "WS status disconnect", { remoteAddr: req.ip });
+      statusFeed.unsubscribe(subscriber);
+    });
+    ws.on("error", () => {
+      statusFeed.unsubscribe(subscriber);
+    });
+  })();
 });
 
 // Proxy: capture pane from a peer

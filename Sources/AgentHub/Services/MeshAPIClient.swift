@@ -41,7 +41,16 @@ enum MeshAPIClient {
             return nil
         }
 
-        return meshResponse.sessions.map { s in
+        return mapSessions(meshResponse.sessions)
+    }
+
+    /// Maps the server's session payloads onto the app's model.
+    ///
+    /// Both transports use this: the HTTP poll of `/api/mesh/sessions` and the
+    /// `/ws/status` feed. They must agree, or the app shows different sessions
+    /// depending on which transport happened to be live.
+    static func mapSessions(_ meshSessions: [MeshSession]) -> [ClaudeSession] {
+        meshSessions.map { s in
             let status = ClaudeSession.SessionStatus(wire: s.status)
 
             let activity: Date? = s.lastActivity.flatMap { ts in

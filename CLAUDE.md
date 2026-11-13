@@ -34,7 +34,7 @@ This repo is a **monorepo** for two apps that share one server and one set of co
 | `docs/adr/` | Every architecture decision record, both apps'. Each carries a `Scope:` field — `system`, `web`, or `macos`. |
 | `docs/agents/` | How the engineering skills consume this repo's domain docs, issue tracker, and triage labels. |
 
-The macOS app is a *client* of the web server: it polls `/api/mesh/sessions`, creates sessions through `POST /api/sessions`, and syncs sidebar groups via `/api/sidebar-groups`. The server owns session creation, the active-session registry (session restore), and the launch specs.
+The macOS app is a *client* of the web server: it subscribes to the `/ws/status` feed for session status (falling back to polling `/api/mesh/sessions` when the feed is down), creates sessions through `POST /api/sessions`, and syncs sidebar groups via `/api/sidebar-groups`. The server owns session creation, the active-session registry (session restore), and the launch specs.
 
 **Anti-drift rule**: any behaviour the two apps must agree on gets a case in `contract/` and a test in both suites (`Tests/AllMyAgentsTests/ContractTests.swift` and `web/test/contract.test.js`). Do not add the same rule twice in two languages — add the case to the fixture and assert both sides resolve it identically. This is the fix for the sidebar-group bug (web ADR 0006 existed; the macOS app never got the rule).
 
@@ -90,6 +90,7 @@ The web app lives in `web/` and is the **server** the macOS app talks to.
 - Runs standalone (`node web/server.js`) or as a launchd agent. The installed agent now points at `/Users/andy/Repos/all-my-agents/web` (it used to point at the standalone `all-my-agents-web` checkout).
 - If using launchd with `KeepAlive`, always use `launchctl stop/start` — never `kill`
 - It owns: session creation (`POST /api/sessions`), the active-session registry and boot-time restore (`~/.local/state/all-my-agents/active-sessions.json`), launch specs, mesh aggregation (`/api/mesh/sessions`), and the surface-token scheme that makes agent status event-sourced instead of screen-scraped.
+- `/ws/status` pushes a full snapshot of the mesh's sessions to subscribers whenever anything changes. The ticker that produces those snapshots runs only while somebody is subscribed, so an idle server costs exactly what it did before.
 
 The separate All My Agents-Mobile project (also Node) is unrelated to `web/` — it is the phone/browser remote interface.
 

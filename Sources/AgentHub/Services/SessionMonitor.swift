@@ -19,11 +19,18 @@ final class SessionMonitor {
     /// back to local-only (which would cause remote sessions to flicker away).
     private var meshEverSucceeded: Bool = false
 
+    /// The status feed. While it is live the server pushes snapshots to us, so
+    /// the app does not need to poll `/api/mesh/sessions` on top of it.
+    private var feed: StatusFeedClient?
+    private var feedConnected = false
+    private var feedServerURL: String?
+
     init(store: NotificationStore) {
         self.store = store
     }
 
     func start() {
+        ensureFeed()
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.poll()
@@ -35,9 +42,44 @@ final class SessionMonitor {
     func stop() {
         timer?.invalidate()
         timer = nil
+        feed?.disconnect()
+        feed = nil
+        feedConnected = false
+    }
+
+    /// Keeps the status feed pointed at the server the user has configured.
+    private func ensureFeed() {
+        let url = store.meshServerURL
+        guard feedServerURL != url else { return }
+        feedServerURL = url
+        feed?.disconnect()
+
+        let client = StatusFeedClient(serverURL: url)
+        client.onSnapshot = { [weak self] sessions in
+            guard let self else { return }
+            self.meshSkipRemaining = 0
+            self.meshEverSucceeded = true
+            self.store.updateSessions(sessions)
+            self.syncNotifications(sessions: sessions)
+            self.store.syncSidebarOrder()
+        }
+        client.onStateChange = { [weak self] state in
+            guard let self else { return }
+            self.feedConnected = (state == .connected)
+            if state == .connected { self.meshEverSucceeded = true }
+        }
+        feed = client
+        client.connect()
     }
 
     private func poll() {
+        ensureFeed()
+
+        // While the feed is live the server pushes us snapshots as they change.
+        // Polling on top of that would make the server do the same discovery
+        // twice for every tick.
+        if feedConnected { return }
+
         let meshURL = store.meshServerURL
 
         Task.detached(priority: .utility) { [weak self] in
