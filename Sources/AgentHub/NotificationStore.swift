@@ -163,11 +163,7 @@ final class NotificationStore {
     /// Delete a group. Its members' keys vanish, so resolve re-seeds them
     /// at the top of the ungrouped region (web deleteGroup behavior).
     func deleteGroup(_ name: String) {
-        var next = sidebarOrder
-        next.groups[name] = nil
-        next.collapsed[name] = nil
-        next.order = next.order.filter { $0 != name }
-        commitOrder(next)
+        commitOrder(SidebarOrder.deletingGroup(sidebarOrder, name: name))
     }
 
     /// Empty a group without deleting it: members go to the bottom of the
@@ -209,7 +205,10 @@ final class NotificationStore {
         let result = SidebarOrder.resolve(data: sidebarOrder, sessions: visible)
         sidebarOrder = result.data
         if result.changed {
-            SidebarOrder.save(result.data)
+            // A reconcile is not a user edit. Keeping the existing timestamp
+            // stops a seeded copy from masquerading as a fresh edit and
+            // outranking the server's copy.
+            SidebarOrder.saveReconciled(result.data)
         }
         sidebarGroups = result.groups
         ungroupedSessions = result.ungrouped
@@ -253,25 +252,31 @@ final class NotificationStore {
         let entry = SidebarOrder.entry()
         guard let winner = await MeshAPIClient.pushSidebarGroups(entry, serverURL: meshServerURL)
         else { return }
-        applySidebarOrderIfNewer(winner)
+        applySidebarOrderWinner(winner)
     }
 
+    /// Merge the server's copy into the local one.
+    ///
+    /// A copy with groups is never erased by a copy without them (the web
+    /// repo's docs/adr/0006-groups-are-protected.md), so a blank local copy
+    /// adopts the server's groups instead of overwriting them.
     private func mergeSidebarOrder(_ remote: SidebarOrderEntry) async {
-        if SidebarOrder.remoteWins(local: SidebarOrder.entry(), remote: remote) {
-            applySidebarOrderIfNewer(remote)
-        } else if SidebarOrder.entryTimestamp(SidebarOrder.entry()) > 0 {
+        switch SidebarOrder.pickWinner(local: SidebarOrder.entry(), remote: remote) {
+        case .remote:
+            applySidebarOrderWinner(remote)
+        case .local:
             await pushSidebarOrder()
+        case .none:
+            break
         }
     }
 
-    /// Adopt `remote` only when it is strictly newer than the local copy.
-    private func applySidebarOrderIfNewer(_ remote: SidebarOrderEntry) {
-        guard SidebarOrder.remoteWins(local: SidebarOrder.entry(), remote: remote) else { return }
+    /// Adopt `remote` only when it wins the merge.
+    private func applySidebarOrderWinner(_ remote: SidebarOrderEntry) {
+        guard SidebarOrder.pickWinner(local: SidebarOrder.entry(), remote: remote) == .remote else { return }
         SidebarOrder.save(remote.data, updatedAt: remote.updatedAt)
         sidebarOrder = remote.data
-        if refreshSidebarOrder() {
-            scheduleSidebarPush()
-        }
+        refreshSidebarOrder()
     }
 
     // MARK: - Zoom

@@ -16,6 +16,10 @@ struct SidebarOrderData: Codable, Equatable {
     var collapsed: [String: Bool]
     var order: [String]
     var ungroupedOrder: [String]
+    /// Set only when the user deliberately deleted their last group. It is the
+    /// one signal that lets a copy without groups replace one that has them.
+    /// Absent (not false) means "no such statement" — the web's JSON shape.
+    var groupsCleared: Bool? = nil
 
     static func empty() -> SidebarOrderData {
         SidebarOrderData(groups: [:], collapsed: [:], order: [], ungroupedOrder: [])
@@ -78,11 +82,17 @@ enum SidebarOrder {
         }
 
         if obj["groups"] is [String: Any] {
+            // A group name that collides with Object.prototype cannot be stored
+            // as a plain object key, so it is dropped on the way in — the same
+            // normalising the web app's sanitizeSidebarOrder does.
             return SidebarOrderData(
-                groups: obj["groups"] as? [String: [String]] ?? [:],
-                collapsed: obj["collapsed"] as? [String: Bool] ?? [:],
-                order: obj["order"] as? [String] ?? [],
-                ungroupedOrder: obj["ungroupedOrder"] as? [String] ?? []
+                groups: (obj["groups"] as? [String: [String]] ?? [:])
+                    .filter { isSafeGroupName($0.key) },
+                collapsed: (obj["collapsed"] as? [String: Bool] ?? [:])
+                    .filter { isSafeGroupName($0.key) },
+                order: (obj["order"] as? [String] ?? []).filter { isSafeGroupName($0) },
+                ungroupedOrder: obj["ungroupedOrder"] as? [String] ?? [],
+                groupsCleared: isTrueFlag(obj["groupsCleared"]) ? true : nil
             )
         }
 
@@ -103,6 +113,14 @@ enum SidebarOrder {
 
     static func save(_ data: SidebarOrderData, to defaults: UserDefaults = .standard) {
         save(data, updatedAt: nowMillis(), to: defaults)
+    }
+
+    /// Persist a reconciled copy without claiming authorship of it: the
+    /// timestamp stays where the last user edit left it. A reconcile only
+    /// reshuffles keys against the live session list, so it must not make the
+    /// copy look newer than the server's.
+    static func saveReconciled(_ data: SidebarOrderData, to defaults: UserDefaults = .standard) {
+        save(data, updatedAt: loadUpdatedAt(from: defaults), to: defaults)
     }
 
     /// Persist a copy while keeping the given timestamp — used when adopting the
@@ -132,7 +150,13 @@ enum SidebarOrder {
         Int64(Date().timeIntervalSince1970 * 1000)
     }
 
-    // MARK: - Last-writer-wins (mirrors web public/sidebar-sync.js)
+    // MARK: - Merge resolution (mirrors web public/sidebar-sync.js)
+    //
+    // Group definitions are the user's work, not app state: a copy with no
+    // groups can never erase a copy that has them unless it says it meant to
+    // (`groupsCleared: true`). Both surfaces resolve with this rule so a blank
+    // copy cannot win the race against a grouped one. See the web repo's
+    // docs/adr/0006-groups-are-protected.md.
 
     /// Effective sync weight: the explicit timestamp when present, else 1 for a
     /// legacy copy that has content, else 0.
@@ -144,9 +168,55 @@ enum SidebarOrder {
         return hasContent ? 1 : 0
     }
 
-    /// True when the remote copy is strictly newer and should replace the local one.
-    static func remoteWins(local: SidebarOrderEntry, remote: SidebarOrderEntry) -> Bool {
-        entryTimestamp(remote) > entryTimestamp(local)
+    /// Does this copy define any groups?
+    static func hasGroups(_ data: SidebarOrderData?) -> Bool {
+        guard let data else { return false }
+        return !data.groups.isEmpty
+    }
+
+    /// Did the user deliberately delete their last group? Only then may a copy
+    /// without groups erase one that has them.
+    static func clearedGroups(_ data: SidebarOrderData?) -> Bool {
+        data?.groupsCleared == true
+    }
+
+    /// Which side of a merge wins.
+    enum Winner: String {
+        case local, remote, none
+    }
+
+    /// Resolve two copies of the sidebar order into one.
+    ///
+    /// Last-writer-wins by `updatedAt`, with one exception: a copy with no
+    /// groups never erases a copy that has them unless it declared the erasure.
+    static func pickWinner(local: SidebarOrderEntry?, remote: SidebarOrderEntry?) -> Winner {
+        let localTs = entryTimestamp(local)
+        let remoteTs = entryTimestamp(remote)
+        if hasGroups(remote?.data) && !hasGroups(local?.data) && !clearedGroups(local?.data) {
+            return .remote
+        }
+        if hasGroups(local?.data) && !hasGroups(remote?.data) && !clearedGroups(remote?.data) {
+            return .local
+        }
+        if remoteTs > localTs { return .remote }
+        if localTs > remoteTs { return .local }
+        return localTs > 0 ? .local : .none
+    }
+
+    /// Strict `=== true` check: a JSON `1` is not a statement of intent.
+    private static func isTrueFlag(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID() && number.boolValue
+    }
+
+    /// A group name that collides with `Object.prototype` cannot be stored as a
+    /// plain object key: assigning it changes the object's prototype instead of
+    /// adding a key, so the group silently disappears. Such a name is refused
+    /// wherever a group name becomes an object key, on both sides, so they
+    /// agree on what a group is.
+    static func isSafeGroupName(_ name: String) -> Bool {
+        guard !name.isEmpty else { return false }
+        return name != "__proto__" && name != "constructor" && name != "prototype"
     }
 
     // MARK: - Pure mutations
@@ -166,9 +236,18 @@ enum SidebarOrder {
         next.ungroupedOrder = next.ungroupedOrder.filter { $0 != key }
 
         if let target {
+            // A name that cannot be stored as an object key is not a group: the
+            // session lands in the ungrouped region instead of vanishing.
+            guard isSafeGroupName(target) else {
+                next.ungroupedOrder.insert(key, at: clamp(index, count: next.ungroupedOrder.count))
+                return next
+            }
             if next.groups[target] == nil {
                 next.groups[target] = []
                 if !next.order.contains(target) { next.order.append(target) }
+                // The user has groups again, so any earlier "I cleared them"
+                // no longer holds.
+                next.groupsCleared = nil
             }
             let members = next.groups[target] ?? []
             var updated = members
@@ -176,6 +255,23 @@ enum SidebarOrder {
             next.groups[target] = updated
         } else {
             next.ungroupedOrder.insert(key, at: clamp(index, count: next.ungroupedOrder.count))
+        }
+        return next
+    }
+
+    /// Delete a group. Its members' keys vanish, so resolve re-seeds them at
+    /// the top of the ungrouped region (web deleteGroup behavior).
+    ///
+    /// Deleting the last group is the only way the user can mean "no groups",
+    /// so that intent is recorded in `groupsCleared` — it is what lets this
+    /// copy replace one that still has groups.
+    static func deletingGroup(_ data: SidebarOrderData, name: String) -> SidebarOrderData {
+        var next = data
+        next.groups[name] = nil
+        next.collapsed[name] = nil
+        next.order = next.order.filter { $0 != name }
+        if next.groups.isEmpty {
+            next.groupsCleared = true
         }
         return next
     }

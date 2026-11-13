@@ -13,8 +13,13 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "AllMyAgents",
-            dependencies: ["AXSwift", "SwiftTerm"],
+            dependencies: ["AXSwift","SwiftTerm"],
             path: "Sources/AgentHub"
+        ),
+        .testTarget(
+            name: "AllMyAgentsTests",
+            dependencies: ["AllMyAgents"],
+            path: "Tests/AllMyAgentsTests"
         )
     ]
 )
