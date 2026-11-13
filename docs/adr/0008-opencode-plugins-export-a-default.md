@@ -68,3 +68,6 @@ npm update of the third-party bundle changes nothing.
   annoyance returns but no notification is missed.
 - The opt-in is per session id and survives a restart, because the marker
   is a file. A new session starts opted out.
+- The Superwhisper gate described in this ADR was retired by ADR 0012. The
+  rule here — export a default, drive third parties through their own
+  contract — still governs the status adapter.
