@@ -39,7 +39,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = "All My Agents"
-        window.minSize = NSSize(width: 560, height: 300)
         window.isReleasedWhenClosed = false
         window.center()
         window.setFrameAutosaveName("AllMyAgentsMainWindow")
@@ -48,7 +47,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rootView: FloatingPanelRootView(store: NotificationStore.shared)
         )
 
+        // The window follows the sidebar: widening the sidebar grows the
+        // window rather than squeezing the content beside it.
+        let store = NotificationStore.shared
+        store.onSidebarLayoutChange = { [weak self] in
+            self?.resizeWindowToFitSidebar()
+        }
+
         window.makeKeyAndOrderFront(nil)
+        resizeWindowToFitSidebar()
 
         // Start webhook server
         do {
@@ -67,7 +74,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         BackupService.shared.start()
 
         // Update badge when store changes
-        let store = NotificationStore.shared
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.updateBadge(waitingCount: store.waitingCount)
@@ -109,6 +115,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Also update dock badge
         NSApp.dockTile.badgeLabel = waitingCount > 0 ? "\(waitingCount)" : nil
+    }
+
+    /// Keeps the window wide enough for the sidebar beside a usable content
+    /// area. Widening the sidebar grows the window rather than squeezing the
+    /// content; narrowing it lets the window be dragged narrower too.
+    private func resizeWindowToFitSidebar() {
+        guard let window else { return }
+        let store = NotificationStore.shared
+        let minimum = store.sidebarVisible
+            ? SidebarWidth.panelWidth(forSidebarWidth: store.sidebarWidth)
+            : 380
+        window.minSize = NSSize(width: minimum, height: 300)
+
+        // Grow the window if it is already narrower than the sidebar needs.
+        // The right edge moves so the sidebar stays where the user put it.
+        let contentWidth = window.contentView?.bounds.width ?? 0
+        guard contentWidth > 0, contentWidth < minimum else { return }
+        var frame = window.frame
+        frame.size.width += minimum - contentWidth
+        window.setFrame(frame, display: true)
     }
 
     // MARK: - Main Menu

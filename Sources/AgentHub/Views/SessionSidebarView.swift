@@ -21,6 +21,9 @@ struct SessionSidebarView: View {
     @State private var renameGroupText = ""
     @State private var groupToRename: String? = nil
     @State private var trailingTargeted = false
+    /// The sidebar width when the current resize drag began, so the drag
+    /// tracks the pointer rather than compounding on itself.
+    @State private var resizeStartWidth: CGFloat? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -29,7 +32,8 @@ struct SessionSidebarView: View {
             machineFilterBar
             sessionList
         }
-        .frame(width: 200)
+        .frame(width: store.sidebarWidth)
+        .overlay(alignment: .trailing) { resizeHandle }
         .background(.ultraThinMaterial)
         .sheet(isPresented: Binding(
             get: { store.showingAddSession },
@@ -75,6 +79,39 @@ struct SessionSidebarView: View {
         } message: { name in
             Text("Rename group \"\(name)\" to:")
         }
+    }
+
+    /// A thin strip on the sidebar's trailing edge. Drag it to resize the
+    /// sidebar; double-click it to reset the width.
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(.clear)
+            .frame(width: 6)
+            .contentShape(Rectangle())
+            .onHover { inside in
+                if inside {
+                    NSCursor.resizeLeftRight.push()
+                } else {
+                    NSCursor.pop()
+                }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        // The translation is relative to where the drag began,
+                        // so the width at that moment is the starting point.
+                        let start = resizeStartWidth ?? store.sidebarWidth
+                        if resizeStartWidth == nil { resizeStartWidth = start }
+                        store.resizeSidebar(to: start + value.translation.width)
+                    }
+                    .onEnded { _ in
+                        resizeStartWidth = nil
+                        store.commitSidebarWidth()
+                    }
+            )
+            .onTapGesture(count: 2) {
+                store.resetSidebarWidth()
+            }
     }
 
     private var machineFilterBar: some View {

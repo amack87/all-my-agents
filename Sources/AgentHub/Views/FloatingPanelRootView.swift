@@ -44,7 +44,7 @@ struct FloatingPanelRootView: View {
             }
             mainContent
         }
-        .frame(minWidth: store.sidebarVisible ? 560 : 380, minHeight: 300)
+        .frame(minWidth: store.sidebarVisible ? SidebarWidth.panelWidth(forSidebarWidth: store.sidebarWidth) : 380, minHeight: 300)
         .background {
             Button("") { store.toggleSidebar() }
                 .keyboardShortcut("\\", modifiers: .command)

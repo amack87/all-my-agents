@@ -307,6 +307,36 @@ final class NotificationStore {
         UserDefaults.standard.set(defaultIndex, forKey: Self.zoomDefaultsKey)
     }
 
+    // MARK: - Sidebar width
+
+    /// Width of the session sidebar in points. The user resizes it by dragging
+    /// the divider. The value is per-machine and never synced — the web app
+    /// keeps its own width in localStorage.
+    private(set) var sidebarWidth: CGFloat = SidebarWidth.load()
+
+    /// Called whenever the sidebar's width or visibility changes, so the
+    /// window can be resized to keep the content area beside it usable.
+    var onSidebarLayoutChange: (() -> Void)?
+
+    /// Moves the divider while the user is dragging it. The width is not
+    /// persisted until the drag ends.
+    func resizeSidebar(to width: CGFloat) {
+        sidebarWidth = SidebarWidth.clamp(width)
+        onSidebarLayoutChange?()
+    }
+
+    /// Persists the current width once a drag ends.
+    func commitSidebarWidth() {
+        SidebarWidth.save(sidebarWidth)
+    }
+
+    /// Returns the sidebar to its default width.
+    func resetSidebarWidth() {
+        sidebarWidth = SidebarWidth.defaultWidth
+        SidebarWidth.reset()
+        onSidebarLayoutChange?()
+    }
+
     enum SpeedrunState: Equatable {
         case idle
         case viewing(UUID)
@@ -533,6 +563,7 @@ final class NotificationStore {
 
     func toggleSidebar() {
         sidebarVisible = !sidebarVisible
+        onSidebarLayoutChange?()
     }
 
     // MARK: - Speedrun
