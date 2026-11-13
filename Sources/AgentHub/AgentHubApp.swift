@@ -62,6 +62,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sessionMonitor = SessionMonitor(store: NotificationStore.shared)
         sessionMonitor?.start()
 
+        // Start the periodic backup timer. Backups are driven locally by the
+        // hibernator CLI — the web server has no backup route.
+        BackupService.shared.start()
+
         // Update badge when store changes
         let store = NotificationStore.shared
         Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -71,8 +75,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
+    /// Hibernate idle sessions on quit so their context survives the exit.
+    /// Best effort: the app is terminating, so this runs synchronously with
+    /// a short cap and never blocks the quit for long.
+    func applicationWillTerminate(_ notification: Notification) {
+        let idle = NotificationStore.shared.sessions
+            .compactMap { $0.status == .idle ? $0.tmuxSession : nil }
+        _ = BackupService.shared.hibernateOnQuit(sessionNames: idle)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {        if !flag {
             window.makeKeyAndOrderFront(nil)
         }
         return true
