@@ -6,7 +6,7 @@
   "author": "Andrew Mackenzie",
   "repository": {
     "type": "git",
-    "url": "https://github.com/amack87/all-my-agents-web.git"
+    "url": "https://github.com/amack87/all-my-agents.git"
   },
   "type": "module",
   "engines": {

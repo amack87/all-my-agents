@@ -5,8 +5,8 @@ A web interface for managing AI coding agent sessions (Claude Code, Cursor, Aide
 ## Quickstart
 
 ```bash
-git clone https://github.com/amack87/all-my-agents-web.git
-cd all-my-agents-web
+git clone https://github.com/amack87/all-my-agents.git
+cd all-my-agents/web
 npm install
 cp mesh.config.example.json mesh.config.json
 ```
@@ -233,7 +233,7 @@ path of `integrations/claude/ama-status-hook.js`:
   "hooks": {
     "Stop": [
       { "hooks": [{ "type": "command",
-        "command": "node /path/to/all-my-agents-web/integrations/claude/ama-status-hook.js" }] }
+        "command": "node /path/to/all-my-agents/web/integrations/claude/ama-status-hook.js" }] }
     ]
   }
 }

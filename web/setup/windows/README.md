@@ -264,7 +264,7 @@ So the setup does not assume you can paste anything into the VM. Instead,
 it is not reachable from the Wi-Fi LAN:
 
 ```bash
-cd /path/to/all-my-agents-web
+cd /path/to/all-my-agents/web
 nohup python3 -m http.server 8099 --bind 192.168.64.1 --directory setup/windows \
   > /tmp/ama-http.log 2>&1 &
 ```
