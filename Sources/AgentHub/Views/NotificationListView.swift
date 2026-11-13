@@ -277,12 +277,7 @@ struct NotificationListView: View {
     // MARK: - Helpers
 
     func statusLabelText(for session: ClaudeSession) -> String {
-        switch session.status {
-        case .needsInput: return "needs input"
-        case .working: return "working"
-        case .idle: return "idle"
-        case .unknown: return "unknown"
-        }
+        session.status.label
     }
 
     private func notificationFor(_ session: ClaudeSession) -> AgentNotification? {
@@ -335,7 +330,7 @@ private struct TrackedSessionRow: View {
         switch session.status {
         case .needsInput: return .orange
         case .working: return .green
-        case .idle: return .gray
+        case .idle, .ended: return .gray
         case .unknown: return .gray.opacity(0.5)
         }
     }
@@ -345,6 +340,7 @@ private struct TrackedSessionRow: View {
         case .needsInput: return "needs input"
         case .working: return "working"
         case .idle: return "idle"
+        case .ended: return "ended"
         case .unknown: return ""
         }
     }
@@ -353,7 +349,7 @@ private struct TrackedSessionRow: View {
         switch session.status {
         case .needsInput: return .orange
         case .working: return .green
-        case .idle: return .gray
+        case .idle, .ended: return .gray
         case .unknown: return .gray.opacity(0.5)
         }
     }

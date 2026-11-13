@@ -9,6 +9,7 @@ import { moveSession, moveGroup, resolveOrder } from "./session-order.js";
 import { pickWinner, isSafeGroupName, sanitizeSidebarOrder } from "./sidebar-sync.js";
 import { resizeFrame, claimFrame, CLAIM_HEARTBEAT_MS, shouldHeartbeat, isTouched } from "./terminal-size.js";
 import { esc } from "./escape.js";
+import { statusLabel } from "./session-status.js";
 
 // --- Theme Helpers ---
 function getTerminalTheme() {
@@ -975,17 +976,6 @@ function isInterestingCommand(cmd, agent) {
   // Skip if it just duplicates the agent label
   if (agent && base === agent.toLowerCase()) return false;
   return true;
-}
-
-function statusLabel(status) {
-  const labels = {
-    needsInput: "Input",
-    working: "Working",
-    idle: "Idle",
-    ended: "Ended",
-    unknown: "...",
-  };
-  return labels[status] || status;
 }
 
 // Returns a CSS color for inactive sessions: accent fading to muted

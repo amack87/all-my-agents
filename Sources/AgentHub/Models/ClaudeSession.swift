@@ -1,10 +1,11 @@
 import Foundation
 
 struct ClaudeSession: Identifiable, Sendable, Equatable {
-    enum SessionStatus: Sendable, Equatable {
+    enum SessionStatus: Sendable, Equatable, CaseIterable {
         case working      // actively processing (no prompt visible)
         case needsInput   // waiting for user — asked a question or has pending edits
         case idle         // finished work, sitting at prompt
+        case ended        // the agent's session is over — it exited or was shut down
         case unknown
     }
 

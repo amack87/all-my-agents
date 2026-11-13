@@ -5,6 +5,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
+import { normalizeStatus, sortSessionsByStatus } from "./public/session-status.js";
+
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = join(__dirname, "mesh.config.json");
@@ -232,7 +234,6 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
     const url = `http://${peer.host}:${peer.port || DEFAULT_PORT}/api/sessions`;
     const res = await fetch(url, { signal: controller.signal });
     const sessions = await res.json();
-    const VALID_STATUSES = new Set(["needsInput", "working", "idle", "ended", "unknown"]);
     return {
       peer,
       sessions: sessions.map((s) => ({
@@ -241,7 +242,7 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
         tty: String(s.tty ?? ""),
         currentCommand: String(s.currentCommand ?? ""),
         windowName: String(s.windowName ?? ""),
-        status: VALID_STATUSES.has(s.status) ? s.status : "unknown",
+        status: normalizeStatus(s.status),
         agent: typeof s.agent === "string" ? s.agent : "shell",
         projectPath: s.projectPath ? String(s.projectPath) : undefined,
         summary: s.summary ? String(s.summary) : undefined,
@@ -289,13 +290,7 @@ export async function fetchAllMeshSessions(localSessions, config) {
   }
 
   // Sort: needsInput first, then working, then idle, then ended, then unknown — by most recent activity within group
-  const priority = { needsInput: 0, working: 1, idle: 2, ended: 3, unknown: 4 };
-  const sorted = [...allSessions].sort((a, b) => {
-    const pa = priority[a.status] ?? 4;
-    const pb = priority[b.status] ?? 4;
-    if (pa !== pb) return pa - pb;
-    return (b.lastActivity || 0) - (a.lastActivity || 0);
-  });
+  const sorted = sortSessionsByStatus(allSessions);
 
   return { sessions: sorted, peerStatus };
 }

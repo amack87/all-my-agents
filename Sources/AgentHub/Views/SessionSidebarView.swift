@@ -360,7 +360,7 @@ struct SessionRowView: View {
         switch session.status {
         case .needsInput: return .orange
         case .working: return .green
-        case .idle, .unknown: return idleFadingColor
+        case .idle, .ended, .unknown: return idleFadingColor
         }
     }
 

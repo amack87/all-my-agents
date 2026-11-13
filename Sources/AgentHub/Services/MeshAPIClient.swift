@@ -42,12 +42,7 @@ enum MeshAPIClient {
         }
 
         return meshResponse.sessions.map { s in
-            let status: ClaudeSession.SessionStatus = switch s.status {
-            case "working": .working
-            case "needsInput": .needsInput
-            case "idle": .idle
-            default: .unknown
-            }
+            let status = ClaudeSession.SessionStatus(wire: s.status)
 
             let activity: Date? = s.lastActivity.flatMap { ts in
                 ts > 0 ? Date(timeIntervalSince1970: TimeInterval(ts)) : nil

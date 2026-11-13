@@ -1,0 +1,36 @@
+{
+  "note": "The session status vocabulary both apps must agree on. The web server emits these wire strings (web/mesh.js, web/agent-events.js); the web client renders them (web/public/app.js) and the macOS app maps them onto ClaudeSession.SessionStatus and renders them (Sources/AgentHub/Views). When the vocabulary changes, this file changes in the same commit and both suites fail until both sides agree.",
+  "statuses": ["needsInput", "working", "idle", "ended", "unknown"],
+  "priority": {
+    "needsInput": 0,
+    "working": 1,
+    "idle": 2,
+    "ended": 3,
+    "unknown": 4
+  },
+  "labels": {
+    "web": {
+      "needsInput": "Input",
+      "working": "Working",
+      "idle": "Idle",
+      "ended": "Ended",
+      "unknown": "..."
+    },
+    "macos": {
+      "needsInput": "needs input",
+      "working": "working",
+      "idle": "idle",
+      "ended": "ended",
+      "unknown": "unknown"
+    }
+  },
+  "wireCases": [
+    { "name": "an explicit needsInput string maps to needs input", "wire": "needsInput", "expected": "needsInput" },
+    { "name": "an explicit working string maps to working", "wire": "working", "expected": "working" },
+    { "name": "an explicit idle string maps to idle", "wire": "idle", "expected": "idle" },
+    { "name": "an explicit ended string maps to ended, not unknown", "wire": "ended", "expected": "ended" },
+    { "name": "an explicit unknown string maps to unknown", "wire": "unknown", "expected": "unknown" },
+    { "name": "a missing status maps to unknown", "wire": null, "expected": "unknown" },
+    { "name": "an unrecognised status maps to unknown", "wire": "banana", "expected": "unknown" }
+  ]
+}

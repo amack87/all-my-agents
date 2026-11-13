@@ -24,6 +24,7 @@ import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubm
 import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
 import { isTrustedConnection } from "./network-access.js";
 import { pickWinner, sanitizeSidebarOrder } from "./public/sidebar-sync.js";
+import { statusPriority } from "./public/session-status.js";
 import { readSize, CLAIM_FRAME_TYPE } from "./public/terminal-size.js";
 import { buildListClientsArgs, buildSwitchClientArgs, findClientByPid, parseClientList } from "./tmux-client.js";
 import { createLease, requestLease, releaseLease } from "./pane-lease.js";
@@ -1420,11 +1421,9 @@ async function discoverSessions() {
   }
 
   // Sort: needsInput first, then working, then idle, then ended, then unknown
-  const priority = { needsInput: 0, working: 1, idle: 2, ended: 3, unknown: 4 };
   sessions.sort((a, b) => {
-    const pa = priority[a.status] ?? 4;
-    const pb = priority[b.status] ?? 4;
-    if (pa !== pb) return pa - pb;
+    const byStatus = statusPriority(a.status) - statusPriority(b.status);
+    if (byStatus !== 0) return byStatus;
     // Within same priority, sort by most recent activity first
     return (b.lastActivity || 0) - (a.lastActivity || 0);
   });
