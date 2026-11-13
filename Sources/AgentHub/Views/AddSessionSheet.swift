@@ -22,6 +22,8 @@ struct AddSessionSheet: View {
     @State private var isCreating: Bool = false
     @State private var isRestoring: String? = nil
     @State private var errorMessage: String? = nil
+    @State private var machineOptions: [MachineOption] = []
+    @State private var selectedDestination: SessionDestination = .local
 
     var body: some View {
         VStack(spacing: 0) {
@@ -126,6 +128,15 @@ struct AddSessionSheet: View {
                 .textFieldStyle(.roundedBorder)
                 .onSubmit { createNewSession() }
 
+            if machineOptions.count > 1 {
+                Picker("Machine", selection: $selectedDestination) {
+                    ForEach(machineOptions) { option in
+                        Text(option.label).tag(option.destination)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+
             if let error = errorMessage {
                 Text(error)
                     .font(.caption)
@@ -148,13 +159,37 @@ struct AddSessionSheet: View {
             Spacer()
         }
         .padding(.horizontal, 20)
+        .task { await loadMachineOptions() }
+    }
+
+    /// The machines that can host a new session: this machine, the server's
+    /// mesh peers, the machines already seen in the sidebar, and the
+    /// launch-command targets — in the web app's order.
+    private func loadMachineOptions() async {
+        let serverURL = store.meshServerURL
+        async let identity = SessionCreationClient.fetchIdentity(serverURL: serverURL)
+        async let targets = SessionCreationClient.fetchTargets(serverURL: serverURL)
+        let (identityValue, targetsValue) = await (identity, targets)
+
+        let options = SessionCreation.options(
+            identity: identityValue,
+            targets: targetsValue,
+            sessions: store.sessions
+        )
+
+        await MainActor.run {
+            machineOptions = options
+            if !options.contains(where: { $0.destination == selectedDestination }) {
+                selectedDestination = options.first?.destination ?? .local
+            }
+        }
     }
 
     private func createNewSession() {
         let name = newSessionName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty else { return }
 
-        // Validate: no spaces or special chars that tmux dislikes
+        // Same rule the server enforces on POST /api/sessions.
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
         guard name.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
             errorMessage = "Use only letters, numbers, hyphens, underscores"
@@ -164,55 +199,73 @@ struct AddSessionSheet: View {
         isCreating = true
         errorMessage = nil
 
-        Task {
-            // tmux new-session -d creates detached session; stdout is empty on success
-            let _ = await TmuxHelpers.run(arguments: [
-                "new-session", "-d", "-s", name
-            ])
+        let request = SessionCreation.request(for: selectedDestination, name: name)
+        let serverURL = store.meshServerURL
 
-            // Verify the session was actually created
-            let verifyOutput = await TmuxHelpers.run(arguments: [
-                "has-session", "-t", name
-            ])
+        Task {
+            let result = await SessionCreationClient.create(
+                name: name,
+                request: request,
+                serverURL: serverURL
+            )
 
             await MainActor.run {
                 isCreating = false
 
-                // has-session returns empty string on success, nil on failure
-                guard verifyOutput != nil else {
-                    errorMessage = "Failed to create tmux session"
-                    return
-                }
+                switch result {
+                case .failure(let message):
+                    // No local fallback on purpose: a session created outside
+                    // the server loses its launch spec, so a reboot brings back
+                    // an empty shell instead of the agent.
+                    errorMessage = message
+                case .success:
+                    // Unhide if it was previously hidden
+                    store.unhideSession(named: name)
 
-                // Unhide if it was previously hidden
-                store.unhideSession(named: name)
+                    // Tell the store to select this session once the monitor discovers it
+                    store.setPendingSession(named: name)
 
-                // Tell the store to select this session once the monitor discovers it
-                store.setPendingSession(named: name)
-
-                // Navigate immediately using the session name as tmux target
-                let session = store.sessions.first(where: { $0.tmuxSession == name })
-                    ?? ClaudeSession(
-                        id: "tmux-pending-\(name)",
-                        pid: 0,
-                        tty: "",
-                        sessionUUID: nil,
-                        tmuxPane: nil,
-                        tmuxSession: name,
-                        projectPath: nil,
-                        summary: nil,
-                        agent: "shell",
-                        status: .idle,
-                        lastSeen: Date(),
-                        lastActivity: nil,
-                    machine: nil,
-                    machineHost: nil
-                    )
-                dismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    onSelectSession(session)
+                    // Navigate immediately using the session name as tmux target
+                    let session = store.sessions.first(where: { $0.tmuxSession == name })
+                        ?? ClaudeSession(
+                            id: "tmux-pending-\(name)",
+                            pid: 0,
+                            tty: "",
+                            sessionUUID: nil,
+                            tmuxPane: nil,
+                            tmuxSession: name,
+                            projectPath: nil,
+                            summary: nil,
+                            agent: "shell",
+                            status: .idle,
+                            lastSeen: Date(),
+                            lastActivity: nil,
+                            machine: machineLabel,
+                            machineHost: machineHost
+                        )
+                    dismiss()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        onSelectSession(session)
+                    }
                 }
             }
+        }
+    }
+
+    /// The machine a peer session lives on. A target's pane still runs in this
+    /// machine's tmux — only the agent runs remotely.
+    private var machineHost: String? {
+        switch selectedDestination {
+        case .local, .target: "local"
+        case .peer(let host): host
+        }
+    }
+
+    private var machineLabel: String? {
+        switch selectedDestination {
+        case .local, .target: nil
+        case .peer:
+            machineOptions.first { $0.destination == selectedDestination }?.label
         }
     }
 
@@ -373,9 +426,9 @@ struct AddSessionSheet: View {
         errorMessage = nil
 
         Task {
-            let output = await runHibernatorCommand([
+            let output = await HibernatorService.run([
                 "restore", "--json", session.sessionName
-            ])
+            ])?.output
 
             await MainActor.run {
                 isRestoring = nil
@@ -434,61 +487,13 @@ struct AddSessionSheet: View {
 
     private func loadHibernatedSessions() {
         Task {
-            let output = await runHibernatorCommand(["list", "--json"])
+            let output = await HibernatorService.run(["list", "--json"])?.output
             await MainActor.run {
                 guard let output, !output.isEmpty else {
                     hibernatedSessions = []
                     return
                 }
                 hibernatedSessions = HibernatedSession.parse(json: output)
-            }
-        }
-    }
-
-    /// Path to the hibernator CLI. Set HIBERNATOR_CLI env var or probe the
-    /// known install locations (the repo was renamed claude-hibernator →
-    /// tmux-agent-hibernator). Returns nil if not found.
-    private static var hibernatorCLI: String? = {
-        if let envPath = ProcessInfo.processInfo.environment["HIBERNATOR_CLI"] {
-            return FileManager.default.isReadableFile(atPath: envPath) ? envPath : nil
-        }
-        let home = NSHomeDirectory()
-        let candidates = [
-            home + "/Repos/tmux-agent-hibernator/cli.py",
-            home + "/Repos/claude-hibernator/cli.py",
-            home + "/.local/bin/claude-hibernator/cli.py",
-            home + "/claude-hibernator/cli.py",
-        ]
-        return candidates.first { FileManager.default.isReadableFile(atPath: $0) }
-    }()
-
-    private func runHibernatorCommand(_ arguments: [String]) async -> String? {
-        guard let cliPath = Self.hibernatorCLI else { return nil }
-        let parentDir = (cliPath as NSString).deletingLastPathComponent
-        let allArgs = [cliPath] + arguments
-
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-                process.arguments = allArgs
-                process.environment = ProcessInfo.processInfo.environment
-                process.environment?["PYTHONPATH"] = parentDir
-
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = FileHandle.nullDevice
-
-                do {
-                    try process.run()
-                    process.waitUntilExit()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8)?
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                    continuation.resume(returning: output)
-                } catch {
-                    continuation.resume(returning: nil)
-                }
             }
         }
     }
