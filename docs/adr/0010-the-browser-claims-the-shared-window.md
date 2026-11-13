@@ -1,6 +1,7 @@
 # 10. The browser claims the shared window when it comes back
 
 Date: 2026-11-05
+Scope: web
 
 ## Status
 

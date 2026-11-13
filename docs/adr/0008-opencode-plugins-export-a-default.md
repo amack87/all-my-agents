@@ -1,6 +1,7 @@
 # 8. OpenCode plugins export a default, and third-party integrations are driven, not patched
 
 Date: 2026-11-05
+Scope: system
 
 ## Status
 

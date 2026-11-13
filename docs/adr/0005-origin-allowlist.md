@@ -1,6 +1,7 @@
 # 5. Cross-origin requests are refused unless the Origin is a known authority
 
 Date: 2026-11-02
+Scope: system
 
 ## Status
 

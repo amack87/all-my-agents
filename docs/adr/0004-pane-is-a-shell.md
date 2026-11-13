@@ -1,6 +1,7 @@
 # 4. A pane is a shell; the launch command is typed into it
 
 Date: 2026-11-02
+Scope: system
 
 ## Status
 

@@ -10,7 +10,7 @@
 // into attributes such as data-name="...". A peer that reports a session
 // named `x" onmouseover="...` would otherwise run script in the AMA origin —
 // and the AMA origin is on the allowlist, so that script can then drive the
-// API. See docs/adr/0005-origin-allowlist.md.
+// API. See ../docs/adr/0005-origin-allowlist.md.
 //
 // Pure and DOM-free so it can be unit tested. The previous implementation
 // built a <span> and read its innerHTML, which escaped < > & but left quotes

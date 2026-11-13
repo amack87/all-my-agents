@@ -11,7 +11,7 @@ If any of these files don't exist, **proceed silently**. Don't flag their absenc
 
 ## File structure
 
-Single-context repo:
+Single-context monorepo — one glossary and one ADR log for both apps:
 
 ```
 /
@@ -19,12 +19,14 @@ Single-context repo:
 ├── docs/adr/
 │   ├── 0001-<decision>.md
 │   └── 0002-<decision>.md
-├── server.js
-├── mesh.js
-└── public/
+├── Sources/          # the macOS app (Swift)
+├── web/              # the web app + its Node server
+└── contract/         # fixtures both test suites share
 ```
 
-There is no `CONTEXT-MAP.md` and no per-context split; this repo is a single app.
+There is no `CONTEXT-MAP.md` and no per-context split; this repo is a single app with two surfaces.
+
+Every ADR carries a `Scope:` field — `system` (both apps), `web` (the web app only), or `macos` (the macOS app only). An ADR with `Scope: system` binds both apps; read it before touching either.
 
 ## Use the glossary's vocabulary
 

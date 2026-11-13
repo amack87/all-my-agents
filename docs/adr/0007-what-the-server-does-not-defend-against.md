@@ -1,6 +1,7 @@
 # 7. Access control is the origin allowlist, not authentication
 
 Date: 2026-11-05
+Scope: system
 
 ## Status
 

@@ -1,6 +1,7 @@
 # 2. Windows machines are reached over SSH; AMA does not host them natively
 
 Date: 2026-11-01
+Scope: system
 
 ## Status
 

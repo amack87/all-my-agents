@@ -1,6 +1,7 @@
 # 11. The device being looked at keeps asserting; the pane is granted by a lease
 
 Date: 2026-11-06
+Scope: web
 
 ## Status
 

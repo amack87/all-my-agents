@@ -3,7 +3,7 @@
 // (SURFACE_TOKEN_ENV). An agent adapter running inside that pane reads the
 // token and POSTs it to /api/events, so identity resolves without any
 // title/mtime/output matching — the same binding rule cmux uses with
-// CMUX_SURFACE_ID. See docs/adr and agent-events.js resolveIdentity.
+// CMUX_SURFACE_ID. See ../docs/adr and agent-events.js resolveIdentity.
 import { randomBytes } from "node:crypto";
 
 export const SURFACE_TOKEN_ENV = "AMA_SURFACE_TOKEN";

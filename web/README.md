@@ -169,7 +169,7 @@ nothing about it in the UI — the failure is only in
 both ways, so it loads on every version. If you write your own plugin, do the
 same: `export default MyPlugin` next to the named export.
 
-See `docs/adr/0008-opencode-plugins-export-a-default.md`.
+See `../docs/adr/0008-opencode-plugins-export-a-default.md`.
 
 It posts to the local server (`ALL_MY_AGENTS_PORT`, default `3456`). To point
 it elsewhere, set `ALL_MY_AGENTS_URL` (e.g. `http://100.x.x.x:3456`) in the
@@ -294,8 +294,8 @@ curl -X POST http://127.0.0.1:3456/api/sessions \
 The one-time setup on the Windows machine — OpenSSH, the toolchain, the status
 adapter — is scripted in [`setup/windows/`](setup/windows/README.md). AMA itself
 never runs on Windows. See
-[ADR 0002](docs/adr/0002-windows-via-ssh-target.md) for why, and
-[ADR 0004](docs/adr/0004-pane-is-a-shell.md) for how the command reaches the
+[ADR 0002](../docs/adr/0002-windows-via-ssh-target.md) for why, and
+[ADR 0004](../docs/adr/0004-pane-is-a-shell.md) for how the command reaches the
 pane.
 
 ## Configuration
@@ -335,12 +335,12 @@ Speedrun prioritizes sessions needing input across all machines. After you respo
 - Peer session data is schema-validated (allowlisted fields only)
 - tmux target parameters are validated against a strict regex
 - WebSocket proxy buffers are capped to prevent memory exhaustion
-- Connections are accepted only from trusted sources — loopback, Tailscale, and the VM bridge — checked at the TCP level before any HTTP or WebSocket handling sees them. The server listens on `0.0.0.0` so it keeps working when Tailscale arrives late, but a connection from anywhere else is dropped. See [ADR 0003](docs/adr/0003-trusted-source-gate.md).
+- Connections are accepted only from trusted sources — loopback, Tailscale, and the VM bridge — checked at the TCP level before any HTTP or WebSocket handling sees them. The server listens on `0.0.0.0` so it keeps working when Tailscale arrives late, but a connection from anywhere else is dropped. See [ADR 0003](../docs/adr/0003-trusted-source-gate.md).
 - There is no HTTPS. The trusted-source gate, not transport encryption, is what keeps port 3456 off the public internet.
-- Cross-origin requests are refused unless the `Origin` is this machine's own name, a configured mesh peer, or this machine's **full** MagicDNS name — machine and tailnet, matched whole, because another tailnet can publish a name that starts with the same short hostname — and the port has to match too. WebSocket upgrades are checked the same way, because CORS does not apply to them, so a page on another site cannot drive the local server. See [ADR 0005](docs/adr/0005-origin-allowlist.md).
+- Cross-origin requests are refused unless the `Origin` is this machine's own name, a configured mesh peer, or this machine's **full** MagicDNS name — machine and tailnet, matched whole, because another tailnet can publish a name that starts with the same short hostname — and the port has to match too. WebSocket upgrades are checked the same way, because CORS does not apply to them, so a page on another site cannot drive the local server. See [ADR 0005](../docs/adr/0005-origin-allowlist.md).
 - There is no authentication. Anything that can reach the server can drive a terminal, so the trusted-source gate and the origin allowlist are the only defences — do not weaken either to make something reachable.
 - Every value that reaches the markup is escaped, quotes included. A session name arrives from a peer machine over the mesh and lands in `data-` attributes; a name containing a quote would otherwise close the attribute and become markup, and script running in the AMA origin can then drive the API.
-- Two things are deliberately *not* defended, because defending them would not help: session creation is not rate-limited (the same endpoint accepts a command that runs in a pane, so the origin allowlist is the control that matters, not a cap), and the surface token is briefly visible in `ps` to the same user (tmux cannot set a pane environment variable without passing the value in its argv, and the alternatives put it in the scrollback and the shell history). See [ADR 0007](docs/adr/0007-what-the-server-does-not-defend-against.md).
+- Two things are deliberately *not* defended, because defending them would not help: session creation is not rate-limited (the same endpoint accepts a command that runs in a pane, so the origin allowlist is the control that matters, not a cap), and the surface token is briefly visible in `ps` to the same user (tmux cannot set a pane environment variable without passing the value in its argv, and the alternatives put it in the scrollback and the shell history). See [ADR 0007](../docs/adr/0007-what-the-server-does-not-defend-against.md).
 
 ## Known Issues
 

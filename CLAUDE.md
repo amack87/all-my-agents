@@ -30,6 +30,9 @@ This repo is a **monorepo** for two apps that share one server and one set of co
 | `Sources/`, `Tests/`, `Package.swift`, `build.sh`, `Info.plist` | The macOS app (Swift/SwiftUI). Stays at the repo root — the build is unchanged. |
 | `web/` | The web app + its Node server (`web/server.js`, `web/public/`, `web/test/`). Its own `package.json`; tests run with `node --test`. Merged in via `git subtree` (see commit `2b63506`), so its history is preserved. |
 | `contract/` | **Shared contract fixtures** — canonical cases consumed by BOTH test suites. |
+| `CONTEXT.md` | The domain glossary for the whole product. Both apps speak this vocabulary. |
+| `docs/adr/` | Every architecture decision record, both apps'. Each carries a `Scope:` field — `system`, `web`, or `macos`. |
+| `docs/agents/` | How the engineering skills consume this repo's domain docs, issue tracker, and triage labels. |
 
 The macOS app is a *client* of the web server: it polls `/api/mesh/sessions`, creates sessions through `POST /api/sessions`, and syncs sidebar groups via `/api/sidebar-groups`. The server owns session creation, the active-session registry (session restore), and the launch specs.
 
@@ -89,6 +92,20 @@ The web app lives in `web/` and is the **server** the macOS app talks to.
 - It owns: session creation (`POST /api/sessions`), the active-session registry and boot-time restore (`~/.local/state/all-my-agents/active-sessions.json`), launch specs, mesh aggregation (`/api/mesh/sessions`), and the surface-token scheme that makes agent status event-sourced instead of screen-scraped.
 
 The separate All My Agents-Mobile project (also Node) is unrelated to `web/` — it is the phone/browser remote interface.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs live as GitHub issues (`gh` CLI) in `amack87/all-my-agents`, PRDs as `PRD: <feature>` and tickets as `<n> — <title>`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles map 1:1 to `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context — root `CONTEXT.md` + `docs/adr/`. See `docs/agents/domain.md`.
 
 ## Optional: claude-hibernator
 

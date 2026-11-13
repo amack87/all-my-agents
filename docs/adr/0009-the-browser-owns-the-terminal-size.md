@@ -1,6 +1,7 @@
 # 9. The browser owns the terminal size; the server is told only when it changes
 
 Date: 2026-11-05
+Scope: web
 
 ## Status
 

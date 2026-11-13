@@ -1,6 +1,7 @@
 # 6. Group definitions are protected; only an explicit erase may remove them
 
 Date: 2026-11-04
+Scope: system
 
 ## Status
 

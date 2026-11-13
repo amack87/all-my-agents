@@ -1,6 +1,7 @@
 # 1. Sidebar order is manual; status no longer sorts tiles
 
 Date: 2026-10-07
+Scope: system
 
 ## Status
 

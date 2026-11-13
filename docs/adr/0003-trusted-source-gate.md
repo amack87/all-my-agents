@@ -1,6 +1,7 @@
 # 3. Connections are accepted only from trusted sources
 
 Date: 2026-11-02
+Scope: system
 
 ## Status
 

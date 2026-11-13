@@ -2,8 +2,8 @@
 
 These scripts turn a Windows machine into a **target**: a machine AMA drives over
 SSH, on which an agent runs natively. The design rationale is in
-[ADR 0002](../../docs/adr/0002-windows-via-ssh-target.md); the launch mechanism
-is in [ADR 0004](../../docs/adr/0004-pane-is-a-shell.md).
+[ADR 0002](../../../docs/adr/0002-windows-via-ssh-target.md); the launch mechanism
+is in [ADR 0004](../../../docs/adr/0004-pane-is-a-shell.md).
 
 AMA never runs on Windows. It runs on the Mac. The Mac opens an `ssh` client in a
 tmux pane; the agent on the far side runs as a real Windows process, so CRLF

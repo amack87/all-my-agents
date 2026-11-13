@@ -8,7 +8,7 @@
 //     order: [groupName, ...], ungroupedOrder: [key, ...] }
 //
 // Manual order wins: nothing here reads a session's status, so tiles never move
-// themselves. See CONTEXT.md and docs/adr/0001-manual-sidebar-order.md.
+// themselves. See ../CONTEXT.md and ../docs/adr/0001-manual-sidebar-order.md.
 
 import { isSafeGroupName } from "./sidebar-sync.js";
 
