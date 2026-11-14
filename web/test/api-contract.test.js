@@ -10,6 +10,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATUSES } from "../public/session-status.js";
+import { routeTable, missingContractRoutes } from "../api-contract.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractDir = join(here, "..", "..", "contract");
@@ -43,4 +44,68 @@ test("every route the contract publishes declares a method, a path and a shape t
     assert.match(route.path, /^\//, `${name}: path starts with /`);
     assert.ok(contract.shapes[route.shape], `${name}: shape "${route.shape}" is defined`);
   }
+});
+
+// --- The server's real route table ---
+
+function routeLayer(method, path) {
+  return { route: { methods: { [method.toLowerCase()]: true }, path } };
+}
+function otherLayer(name) {
+  return { name };
+}
+
+test("routeTable reads a router stack, ignoring layers that are not routes", () => {
+  const app = {
+    _router: {
+      stack: [
+        otherLayer("query"),
+        otherLayer("expressInit"),
+        otherLayer("jsonParser"),
+        otherLayer("serveStatic"),
+        routeLayer("get", "/api/sessions"),
+        routeLayer("post", "/api/sessions"),
+      ],
+    },
+  };
+  assert.deepEqual(routeTable(app), [
+    { method: "GET", path: "/api/sessions" },
+    { method: "POST", path: "/api/sessions" },
+  ]);
+});
+
+test("routeTable compares named parameters the way the contract writes them", () => {
+  const app = { _router: { stack: [routeLayer("post", "/api/sessions/:name/rename")] } };
+  assert.deepEqual(routeTable(app), [{ method: "POST", path: "/api/sessions/{name}/rename" }]);
+});
+
+test("routeTable reads an express-ws websocket route as a WS route", () => {
+  // express-ws registers its websocket routes as GET /ws/status/.websocket;
+  // a client subscribes to /ws/status, so that is what the table should say.
+  const app = { _router: { stack: [routeLayer("get", "/ws/status/.websocket")] } };
+  assert.deepEqual(routeTable(app), [{ method: "WS", path: "/ws/status" }]);
+});
+
+test("missingContractRoutes names what the contract publishes that the server does not serve", () => {
+  const lying = {
+    routes: {
+      listSessions: { method: "GET", path: "/api/sessions", shape: "sessionList" },
+      ghost: { method: "GET", path: "/api/ghost", shape: "sessionList" },
+    },
+  };
+  const table = [{ method: "GET", path: "/api/sessions" }];
+  assert.deepEqual(missingContractRoutes(lying, table), [
+    { name: "ghost", method: "GET", path: "/api/ghost" },
+  ]);
+});
+
+test("missingContractRoutes is empty when the contract tells the truth", () => {
+  const table = [{ method: "GET", path: "/api/sessions" }, { method: "WS", path: "/ws/status" }];
+  const honest = {
+    routes: {
+      listSessions: { method: "GET", path: "/api/sessions", shape: "sessionList" },
+      statusFeed: { method: "WS", path: "/ws/status", shape: "statusFrame" },
+    },
+  };
+  assert.deepEqual(missingContractRoutes(honest, table), []);
 });
