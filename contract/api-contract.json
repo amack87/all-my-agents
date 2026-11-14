@@ -1,0 +1,101 @@
+{
+  "note": "AMA's published API contract: the status vocabulary, the routes a client may call, and the shape of what those routes return. The server builds the document it serves at GET /api/contract from its own vocabulary and route table, and its suite asserts the served document matches this fixture — so a change to either surfaces as a test failure, not as a difference. A client fetches this document rather than assuming it, and keeps a vendored copy as its fallback. Changing this contract's content is a change to a public surface: bump `version` in the same commit, and update the client's vendored copy.",
+  "version": "1",
+  "statuses": {
+    "vocabulary": ["needsInput", "working", "idle", "ended", "unknown"],
+    "working": ["working"],
+    "turnOver": ["ended", "idle", "needsInput"]
+  },
+  "routes": {
+    "listSessions": { "method": "GET", "path": "/api/sessions", "shape": "sessionList" },
+    "createSession": { "method": "POST", "path": "/api/sessions", "shape": "createdSession" },
+    "reportEvent": { "method": "POST", "path": "/api/events", "shape": "eventAck" },
+    "meshSessions": { "method": "GET", "path": "/api/mesh/sessions", "shape": "meshSnapshot" },
+    "health": { "method": "GET", "path": "/api/health", "shape": "health" },
+    "statusFeed": { "method": "WS", "path": "/ws/status", "shape": "statusFrame" }
+  },
+  "shapes": {
+    "session": {
+      "type": "object",
+      "fields": {
+        "name": { "type": "string" },
+        "paneId": { "type": "string" },
+        "tty": { "type": "string" },
+        "currentCommand": { "type": "string" },
+        "windowName": { "type": "string" },
+        "status": { "type": "vocabulary" },
+        "source": { "type": "string" },
+        "agent": { "type": "string" },
+        "lastActivity": { "type": "number" },
+        "projectPath": { "type": "string", "optional": true },
+        "summary": { "type": "string", "optional": true }
+      }
+    },
+    "sessionList": { "type": "array", "items": "session" },
+    "createdSession": {
+      "type": "object",
+      "fields": {
+        "ok": { "type": "boolean" },
+        "name": { "type": "string" },
+        "command": { "type": ["string", "null"] }
+      }
+    },
+    "eventAck": {
+      "type": "object",
+      "fields": {
+        "ok": { "type": "boolean" },
+        "target": { "type": ["string", "null"] },
+        "name": { "type": "string" },
+        "event": { "type": "string" },
+        "known": { "type": "boolean" },
+        "status": { "type": ["vocabulary", "null"] },
+        "source": { "type": ["string", "null"] },
+        "changed": { "type": "boolean" }
+      }
+    },
+    "meshSession": {
+      "type": "object",
+      "fields": {
+        "name": { "type": "string" },
+        "paneId": { "type": "string" },
+        "tty": { "type": "string" },
+        "currentCommand": { "type": "string" },
+        "windowName": { "type": "string" },
+        "status": { "type": "vocabulary" },
+        "source": { "type": "string" },
+        "agent": { "type": "string" },
+        "lastActivity": { "type": "number" },
+        "projectPath": { "type": "string", "optional": true },
+        "summary": { "type": "string", "optional": true },
+        "machine": { "type": "string" },
+        "machineHost": { "type": "string" }
+      }
+    },
+    "meshSnapshot": {
+      "type": "object",
+      "fields": {
+        "sessions": { "type": "array", "items": "meshSession" },
+        "peerStatus": { "type": "object" }
+      }
+    },
+    "health": {
+      "type": "object",
+      "fields": {
+        "status": { "type": "string" },
+        "ptyAllocation": { "type": "boolean" },
+        "tmuxAccess": { "type": "boolean" },
+        "spawnErrors": { "type": "number" },
+        "uptimeMs": { "type": "number" },
+        "pid": { "type": "number" }
+      }
+    },
+    "statusFrame": {
+      "type": "object",
+      "fields": {
+        "type": { "type": "string" },
+        "sessions": { "type": "array", "items": "meshSession" },
+        "peerStatus": { "type": "object" }
+      }
+    }
+  }
+}
