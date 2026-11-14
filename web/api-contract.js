@@ -116,3 +116,74 @@ export function checkShape(shapeName, value, ctx, path = String(shapeName)) {
   }
   return problems;
 }
+
+// --- Building the served document ---
+
+/**
+ * The document the server serves at GET /api/contract: the fixture, with the
+ * vocabulary the server itself speaks. The route table it is given must serve
+ * every route the contract publishes — a contract that lies about a route is
+ * not served, it throws.
+ */
+export function buildContractDocument(contract, table, vocabulary) {
+  const missing = missingContractRoutes(contract, table);
+  if (missing.length > 0) {
+    const described = missing.map((m) => `${m.method} ${m.path} (${m.name})`).join(", ");
+    throw new Error(`the contract publishes routes the server does not serve: ${described}`);
+  }
+  return { ...contract, statuses: { ...contract.statuses, vocabulary: [...vocabulary] } };
+}
+
+/**
+ * Refuse to start rather than serve a contract that lies about a route.
+ * server.js calls this just before it listens; `exit` and `log` are injectable
+ * so the tests can watch the refusal without killing their own process.
+ */
+export function refuseToStartIfContractLies(contract, table, { exit = process.exit, log = console.error } = {}) {
+  const missing = missingContractRoutes(contract, table);
+  if (missing.length === 0) return;
+  log(
+    "ERROR",
+    "The contract publishes routes the server does not serve; refusing to start",
+    { missing },
+  );
+  exit(1);
+}
+
+// --- The shape guard on live responses ---
+
+function contractRouteFor(contract, method, path) {
+  for (const route of Object.values(contract.routes ?? {})) {
+    if (route.method !== method) continue;
+    const pattern = route.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\{(\w+)\\\}/g, "([^/]+)");
+    if (new RegExp(`^${pattern}$`).test(path)) return route;
+  }
+  return null;
+}
+
+/**
+ * Express middleware that checks every response a declared route serves
+ * against the shape the contract publishes for it. A non-2xx answer carries
+ * an error, not the published shape, so only successes are checked; routes
+ * the contract does not publish are not checked at all.
+ *
+ * Problems are reported through `onProblem` (server.js logs them loudly) and
+ * the response is still served: one bad response is a warning about the
+ * contract, not a reason to take the API down.
+ */
+export function createShapeGuard(contract, vocabulary, { onProblem = (problems, ctx) => console.warn(`contract shape violation: ${problems.join("; ")}`, ctx) } = {}) {
+  const ctx = { shapes: contract.shapes, vocabulary: [...vocabulary] };
+  return function shapeGuard(req, res, next) {
+    const route = contractRouteFor(contract, req.method, req.path);
+    if (!route || typeof route.shape !== "string") return next();
+    const originalJson = res.json.bind(res);
+    res.json = (payload) => {
+      if (res.statusCode < 400) {
+        const problems = checkShape(route.shape, payload, ctx);
+        if (problems.length > 0) onProblem(problems, { method: req.method, path: req.originalUrl, status: res.statusCode });
+      }
+      return originalJson(payload);
+    };
+    next();
+  };
+}

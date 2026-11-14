@@ -10,7 +10,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATUSES } from "../public/session-status.js";
-import { routeTable, missingContractRoutes, checkShape } from "../api-contract.js";
+import {
+  routeTable,
+  missingContractRoutes,
+  checkShape,
+  buildContractDocument,
+  createShapeGuard,
+  refuseToStartIfContractLies,
+} from "../api-contract.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractDir = join(here, "..", "..", "contract");
@@ -206,4 +213,96 @@ test("checkShape checks arrays element by element", () => {
   const problems = checkShape("meshSnapshot", { sessions: [meshSession, { ...meshSession, status: "busy" }], peerStatus: {} }, shapeCtx);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /sessions\.1\.status|status/);
+});
+
+// --- Building the served document ---
+
+test("the served document is built from the server's own vocabulary", () => {
+  // The server passes its own word list in; the document carries it, so a
+  // change to the server's vocabulary surfaces instead of being assumed.
+  const table = Object.values(contract.routes).map(({ method, path }) => ({ method, path }));
+  const doc = buildContractDocument(contract, table, ["alpha", "beta"]);
+  assert.deepEqual(doc.statuses.vocabulary, ["alpha", "beta"]);
+  // Everything else is still the fixture.
+  assert.deepEqual(doc.routes, contract.routes);
+});
+
+test("the served document is built from the server's own route table", () => {
+  // A route the contract publishes that the table does not serve is a
+  // refusal to start, not a contract that lies.
+  assert.throws(
+    () => buildContractDocument(contract, [], contract.statuses.vocabulary),
+    /\/api\/health/,
+  );
+});
+
+test("the server refuses to start when the contract publishes a route it does not have", () => {
+  let exitCode = null;
+  const logged = [];
+  refuseToStartIfContractLies(
+    { routes: { ghost: { method: "GET", path: "/api/ghost", shape: "session" } } },
+    [{ method: "GET", path: "/api/sessions" }],
+    { exit: (code) => { exitCode = code; }, log: (...args) => logged.push(args) },
+  );
+  assert.equal(exitCode, 1);
+  assert.match(JSON.stringify(logged), /\/api\/ghost/);
+});
+
+test("the server starts when the contract's routes are all served", () => {
+  let exitCode = null;
+  refuseToStartIfContractLies(
+    { routes: { listSessions: { method: "GET", path: "/api/sessions", shape: "session" } } },
+    [{ method: "GET", path: "/api/sessions" }],
+    { exit: (code) => { exitCode = code; }, log: () => {} },
+  );
+  assert.equal(exitCode, null);
+});
+
+// --- The shape guard on live responses ---
+
+import express from "express";
+
+function call(app, method, url, { body, headers } = {}) {
+  return new Promise((resolve) => {
+    const res = {
+      statusCode: 200,
+      set() { return this; },
+      setHeader() { return this; },
+      status(code) { this.statusCode = code; return this; },
+      json(payload) { resolve({ statusCode: this.statusCode, payload }); return this; },
+      end() { resolve({ statusCode: this.statusCode, payload: undefined }); return this; },
+    };
+    app({ method, url, headers: headers ?? {}, body }, res);
+  });
+}
+
+test("the shape guard stays quiet on a conforming response", async () => {
+  const problems = [];
+  const app = express();
+  app.use(createShapeGuard(contract, contract.statuses.vocabulary, { onProblem: (p) => problems.push(p) }));
+  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null }));
+  const { payload } = await call(app, "POST", "/api/sessions");
+  assert.deepEqual(payload, { ok: true, name: "slice", command: null });
+  assert.deepEqual(problems, []);
+});
+
+test("the shape guard surfaces a response that breaks its declared shape", async () => {
+  const problems = [];
+  const app = express();
+  app.use(createShapeGuard(contract, contract.statuses.vocabulary, { onProblem: (p) => problems.push(...p) }));
+  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null, surprise: 1 }));
+  await call(app, "POST", "/api/sessions");
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /surprise/);
+});
+
+test("the shape guard leaves undeclared routes and error responses alone", async () => {
+  const problems = [];
+  const app = express();
+  app.use(createShapeGuard(contract, contract.statuses.vocabulary, { onProblem: (p) => problems.push(p) }));
+  app.get("/api/undeclared", (_req, res) => res.json({ whatever: true }));
+  app.post("/api/sessions", (_req, res) => res.status(400).json({ error: "bad name" }));
+  await call(app, "GET", "/api/undeclared");
+  await call(app, "POST", "/api/sessions");
+  assert.deepEqual(problems, []);
 });
