@@ -25,10 +25,18 @@ import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./l
 import { isTrustedConnection } from "./network-access.js";
 import { pickWinner, sanitizeSidebarOrder } from "./public/sidebar-sync.js";
 import { statusPriority } from "./public/session-status.js";
+import { STATUSES } from "./public/session-status.js";
 import { readSize, CLAIM_FRAME_TYPE } from "./public/terminal-size.js";
 import { buildListClientsArgs, buildSwitchClientArgs, findClientByPid, parseClientList } from "./tmux-client.js";
 import { createLease, requestLease, releaseLease } from "./pane-lease.js";
 import { createStatusFeed } from "./status-feed.js";
+import {
+  routeTable,
+  buildContractDocument,
+  checkShape,
+  createShapeGuard,
+  refuseToStartIfContractLies,
+} from "./api-contract.js";
 
 // --- Logging ---
 const LOG_DIR = process.env.ALL_MY_AGENTS_LOG_DIR || join(os.homedir(), ".local", "state", "all-my-agents");
@@ -156,6 +164,25 @@ app.use(async (req, res, next) => {
   next();
 });
 app.use(express.static(join(__dirname, "public")));
+
+// --- The published API contract ---
+//
+// The contract fixture is the agreement; the served document is built from
+// this server's own vocabulary and route table, so the two cannot disagree.
+// A route the contract publishes that the server does not serve is a refusal
+// to start (checked just before listen), and the responses the declared
+// routes serve are checked against the shapes the contract publishes.
+const API_CONTRACT = JSON.parse(
+  readFileSync(join(__dirname, "..", "contract", "api-contract.json"), "utf8"),
+);
+app.use(
+  createShapeGuard(API_CONTRACT, STATUSES, {
+    onProblem: (problems, ctx) => log("WARN", "Contract shape violation", { problems, ...ctx }),
+  }),
+);
+app.get("/api/contract", (_req, res) => {
+  res.json(buildContractDocument(API_CONTRACT, routeTable(app), STATUSES));
+});
 
 // --- Config ---
 const TMUX = findTmux();
@@ -1558,6 +1585,15 @@ app.ws("/ws/status", (ws, req) => {
     const subscriber = {
       send: (message) => {
         if (ws.readyState !== 1) return;
+        // The frame is a published shape: check it like any other response
+        // the server serves, and say so loudly when it breaks the contract.
+        const problems = checkShape("statusFrame", message, {
+          shapes: API_CONTRACT.shapes,
+          vocabulary: STATUSES,
+        });
+        if (problems.length > 0) {
+          log("WARN", "Contract shape violation on /ws/status frame", { problems });
+        }
         ws.send(JSON.stringify(message));
       },
     };
@@ -1810,6 +1846,12 @@ const BRIDGE_ADDRESS = findBridgeAddress();
 
 export { app };
 if (process.env.NODE_ENV !== "test") {
+  // The contract is a public surface: refuse to serve one that lies about a
+  // route rather than start with it.
+  refuseToStartIfContractLies(API_CONTRACT, routeTable(app), {
+    exit: (code) => process.exit(code),
+    log: (level, msg, extra) => log(level, msg, extra),
+  });
   const server = app.listen(PORT, "0.0.0.0", () => {
     log("INFO", `Server started on http://0.0.0.0:${PORT} (loopback, Tailscale and VM network only)`);
     log("INFO", `Log file: ${join(LOG_DIR, "server.log")}`);

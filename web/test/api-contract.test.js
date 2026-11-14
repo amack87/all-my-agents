@@ -306,3 +306,43 @@ test("the shape guard leaves undeclared routes and error responses alone", async
   await call(app, "POST", "/api/sessions");
   assert.deepEqual(problems, []);
 });
+
+// --- Against the real server ---
+//
+// server.js exports app and guards app.listen behind NODE_ENV !== "test", so
+// importing it under NODE_ENV=test is safe and does not listen.
+
+process.env.NODE_ENV = "test";
+const { app: server, _realAppForTests } = await import("../server.js");
+const serverTable = routeTable(server);
+
+test("every route the contract publishes exists in the server's real route table", () => {
+  assert.deepEqual(missingContractRoutes(contract, serverTable), []);
+});
+
+function readRoute(serverApp, path) {
+  const layer = serverApp._router.stack.find((l) => l.route && l.route.path === path);
+  assert.ok(layer, `the server has a ${path} route`);
+  const handler = layer.route.stack[layer.route.stack.length - 1].handle;
+  return new Promise((resolve) => {
+    const res = {
+      statusCode: 200,
+      set() { return this; },
+      setHeader() { return this; },
+      status(code) { this.statusCode = code; return this; },
+      json(payload) { resolve(payload); return this; },
+    };
+    handler({ method: "GET", params: {}, query: {}, headers: {}, path, originalUrl: path }, res);
+  });
+}
+
+test("the document the server serves matches the fixture", async () => {
+  const doc = await readRoute(server, "/api/contract");
+  assert.deepEqual(doc, contract);
+});
+
+test("the served vocabulary is the server's own and the shared one", async () => {
+  const doc = await readRoute(server, "/api/contract");
+  assert.deepEqual(doc.statuses.vocabulary, [...STATUSES]);
+  assert.deepEqual(doc.statuses.vocabulary, vocabulary.statuses);
+});
