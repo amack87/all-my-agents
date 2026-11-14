@@ -313,7 +313,7 @@ test("the shape guard leaves undeclared routes and error responses alone", async
 // importing it under NODE_ENV=test is safe and does not listen.
 
 process.env.NODE_ENV = "test";
-const { app: server, _realAppForTests } = await import("../server.js");
+const { app: server } = await import("../server.js");
 const serverTable = routeTable(server);
 
 test("every route the contract publishes exists in the server's real route table", () => {
