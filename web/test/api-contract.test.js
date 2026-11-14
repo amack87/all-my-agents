@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { STATUSES } from "../public/session-status.js";
-import { routeTable, missingContractRoutes } from "../api-contract.js";
+import { routeTable, missingContractRoutes, checkShape } from "../api-contract.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractDir = join(here, "..", "..", "contract");
@@ -108,4 +108,102 @@ test("missingContractRoutes is empty when the contract tells the truth", () => {
     },
   };
   assert.deepEqual(missingContractRoutes(honest, table), []);
+});
+
+// --- Shape checking ---
+
+const shapeCtx = { shapes: contract.shapes, vocabulary: contract.statuses.vocabulary };
+
+function sessionFixture(overrides = {}) {
+  return {
+    name: "slice",
+    paneId: "%0",
+    tty: "/dev/ttys001",
+    currentCommand: "zsh",
+    windowName: "slice",
+    status: "working",
+    source: "screen",
+    agent: "opencode",
+    lastActivity: 1731542400,
+    ...overrides,
+  };
+}
+
+test("checkShape accepts a response that conforms to its declared shape", () => {
+  assert.deepEqual(checkShape("session", sessionFixture(), shapeCtx), []);
+  // Optional fields may be present or absent, but never mistyped.
+  assert.deepEqual(
+    checkShape("session", sessionFixture({ projectPath: "/tmp/x", summary: "hello" }), shapeCtx),
+    [],
+  );
+  assert.deepEqual(
+    checkShape("createdSession", { ok: true, name: "slice", command: null }, shapeCtx),
+    [],
+  );
+});
+
+test("checkShape flags a declared field that is missing", () => {
+  const { command: _omitted, ...short } = { ok: true, name: "slice", command: null };
+  const problems = checkShape("createdSession", short, shapeCtx);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /command/);
+});
+
+test("checkShape flags a declared field of the wrong type", () => {
+  const problems = checkShape("createdSession", { ok: "yes", name: "slice", command: null }, shapeCtx);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /ok/);
+});
+
+test("checkShape flags a field the shape does not declare", () => {
+  // That is the point of publishing: a new field is a deliberate act.
+  const problems = checkShape(
+    "createdSession",
+    { ok: true, name: "slice", command: null, surprise: 1 },
+    shapeCtx,
+  );
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /surprise/);
+});
+
+test("checkShape only accepts vocabulary words where the shape says vocabulary", () => {
+  assert.deepEqual(
+    checkShape("session", sessionFixture({ status: "needsInput" }), shapeCtx),
+    [],
+  );
+  const problems = checkShape("session", sessionFixture({ status: "busy" }), shapeCtx);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /status/);
+});
+
+test("checkShape follows shape references and null unions", () => {
+  const meshSession = { ...sessionFixture({ source: "event" }), machine: "local", machineHost: "local" };
+  assert.deepEqual(
+    checkShape("meshSnapshot", { sessions: [meshSession], peerStatus: { workhorse: "ok" } }, shapeCtx),
+    [],
+  );
+  assert.deepEqual(
+    checkShape(
+      "eventAck",
+      {
+        ok: true,
+        target: "%0",
+        name: "slice",
+        event: "turn_end",
+        known: true,
+        status: null,
+        source: null,
+        changed: false,
+      },
+      shapeCtx,
+    ),
+    [],
+  );
+});
+
+test("checkShape checks arrays element by element", () => {
+  const meshSession = { ...sessionFixture(), machine: "local", machineHost: "local" };
+  const problems = checkShape("meshSnapshot", { sessions: [meshSession, { ...meshSession, status: "busy" }], peerStatus: {} }, shapeCtx);
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /sessions\.1\.status|status/);
 });

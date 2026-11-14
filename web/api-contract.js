@@ -39,3 +39,80 @@ export function missingContractRoutes(contract, table) {
     .filter(([, route]) => !served.has(`${route.method} ${route.path}`))
     .map(([name, route]) => ({ name, method: route.method, path: route.path }));
 }
+
+// --- Shape checking ---
+
+// The primitive types a shape may declare. "vocabulary" is a string that is
+// one of the contract's status words, so a status field cannot drift onto a
+// word the server never emits; "null" exists so an absent value can be
+// spelled honestly.
+const PRIMITIVES = {
+  string: (v) => typeof v === "string",
+  number: (v) => typeof v === "number",
+  boolean: (v) => typeof v === "boolean",
+  null: (v) => v === null,
+  object: (v) => typeof v === "object" && v !== null && !Array.isArray(v),
+  array: (v) => Array.isArray(v),
+};
+
+function isConforming(spec, value, ctx) {
+  const types = Array.isArray(spec.type) ? spec.type : [spec.type];
+  for (const type of types) {
+    if (type === "vocabulary") {
+      if (typeof value === "string" && ctx.vocabulary.includes(value)) return true;
+      continue;
+    }
+    const check = PRIMITIVES[type];
+    if (!check) continue;
+    if (check(value)) {
+      // Recurse only where a non-primitive carries more of itself to check.
+      if (type === "array" && spec.items) {
+        return value.every((item) => checkShape(spec.items, item, ctx).length === 0);
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check a served value against the shape the contract publishes for it.
+ * Returns a list of problems; empty means the response keeps the contract.
+ *
+ * A declared field that is missing or of the wrong type is a problem, and a
+ * field the response carries that the shape does not declare is also a
+ * problem — publishing the API means new fields are a deliberate act.
+ */
+export function checkShape(shapeName, value, ctx, path = String(shapeName)) {
+  // A string names a shape the contract defines; an object is an inline spec
+  // (the field specs inside an object shape).
+  const spec = typeof shapeName === "string" ? ctx.shapes?.[shapeName] : shapeName;
+  if (!spec) return [`${path}: the contract does not define this shape`];
+  const problems = [];
+
+  if (Array.isArray(value) && spec.type === "array") {
+    if (spec.items) {
+      value.forEach((item, i) => problems.push(...checkShape(spec.items, item, ctx, `${path}.${i}`)));
+    }
+    return problems;
+  }
+
+  if (!isConforming(spec, value, ctx)) {
+    problems.push(`${path}: expected ${JSON.stringify(spec.type)}`);
+    return problems;
+  }
+
+  if (spec.fields) {
+    for (const [key, fieldSpec] of Object.entries(spec.fields)) {
+      if (!(key in value)) {
+        if (!fieldSpec.optional) problems.push(`${path}.${key}: declared but missing`);
+        continue;
+      }
+      problems.push(...checkShape(fieldSpec, value[key], ctx, `${path}.${key}`));
+    }
+    for (const key of Object.keys(value)) {
+      if (!(key in spec.fields)) problems.push(`${path}.${key}: not declared by the shape`);
+    }
+  }
+  return problems;
+}
