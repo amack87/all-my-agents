@@ -346,3 +346,15 @@ test("the served vocabulary is the server's own and the shared one", async () =>
   assert.deepEqual(doc.statuses.vocabulary, [...STATUSES]);
   assert.deepEqual(doc.statuses.vocabulary, vocabulary.statuses);
 });
+
+test("the contract publishes the routes a client needs beyond listing sessions", () => {
+  // A client that cannot find a route in the contract has to hard-code its
+  // path, and a hard-coded path is how the two sides drift apart.
+  for (const name of ["capture", "identity", "targets"]) {
+    assert.ok(contract.routes[name], `the contract should publish the "${name}" route`);
+    assert.ok(
+      contract.shapes[contract.routes[name].shape],
+      `the "${name}" route's shape should be declared`,
+    );
+  }
+});

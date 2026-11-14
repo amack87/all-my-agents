@@ -12,7 +12,10 @@
     "reportEvent": { "method": "POST", "path": "/api/events", "shape": "eventAck" },
     "meshSessions": { "method": "GET", "path": "/api/mesh/sessions", "shape": "meshSnapshot" },
     "health": { "method": "GET", "path": "/api/health", "shape": "health" },
-    "statusFeed": { "method": "WS", "path": "/ws/status", "shape": "statusFrame" }
+    "statusFeed": { "method": "WS", "path": "/ws/status", "shape": "statusFrame" },
+    "capture": { "method": "GET", "path": "/api/sessions/{target}/capture", "shape": "capture" },
+    "identity": { "method": "GET", "path": "/api/identity", "shape": "identity" },
+    "targets": { "method": "GET", "path": "/api/targets", "shape": "targetList" }
   },
   "shapes": {
     "session": {
@@ -95,6 +98,37 @@
         "type": { "type": "string" },
         "sessions": { "type": "array", "items": "meshSession" },
         "peerStatus": { "type": "object" }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "fields": {
+        "name": { "type": "string" },
+        "peers": { "type": "array", "items": "peer" }
+      }
+    },
+    "peer": {
+      "type": "object",
+      "fields": {
+        "name": { "type": "string", "optional": true },
+        "host": { "type": "string" },
+        "port": { "type": "number" }
+      }
+    },
+    "targetList": { "type": "array", "items": "target" },
+    "target": {
+      "type": "object",
+      "fields": {
+        "name": { "type": "string" },
+        "label": { "type": "string" }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "fields": {
+        "content": { "type": "string" },
+        "status": { "type": "vocabulary" },
+        "source": { "type": "string" }
       }
     }
   }
