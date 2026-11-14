@@ -15,6 +15,9 @@ Ubiquitous language for All My Agents. Definitions only — no implementation de
 - **Surface token** — a per-session secret that binds a pane to its AMA session. An agent adapter inside the pane reads it from the environment and presents it when reporting status, so the server can tell which session an event came from without matching on screen text.
 - **Launch command** — the command a session's pane runs instead of a default shell. It lets a session reach a machine other than the one hosting it.
 - **Target** — a named remote machine a launch command reaches. A session aimed at a target is hosted by the local machine, but the agent inside it runs on the target.
+- **Contract** — the machine-readable description of AMA's API: the status vocabulary, the routes a client may call, and the shape of what those routes return. A client fetches the contract rather than assuming it, so a change in AMA cannot drift past a client unnoticed.
+- **Agent message** — the text an agent produced, reported by the agent itself rather than read off its screen, and filed against the session its surface token identifies.
+- **Voice bridge** — a separate application that owns the microphone, the speech in and the spoken reply, and drives AMA's sessions through AMA's API. AMA itself has no voice interface.
 
 ## Sidebar arrangement
 
