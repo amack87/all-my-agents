@@ -402,7 +402,7 @@ test("the contract publishes the promptPeerSession route, and its shape is sendA
     path: "/api/proxy/{peerHost}/sessions/{name}/send",
     shape: "sendAck",
   });
-  assert.equal(contract.version, "4", "a change to the published routes is a version bump");
+  assert.equal(contract.version, "5", "a change to the published routes is a version bump");
 
   assert.deepEqual(
     checkShape("sendAck", { ok: true, name: "work", paneId: "%3" }, shapeCtx),
@@ -415,4 +415,44 @@ test("the contract publishes the promptPeerSession route, and its shape is sendA
   );
   assert.equal(problems.length, 1);
   assert.match(problems[0], /surprise/);
+});
+
+test("the contract publishes the peer read routes", () => {
+  // Reading the answer is the other half of prompting it: a peer agent's
+  // reply has to come back through the mesh too, or a session the phone
+  // can prompt but never hear is the same trap the session list once was.
+  // The message proxy serves what the peer's own message route serves, and
+  // the capture proxy what its capture route serves, so both publish the
+  // shapes those routes already declare. A peer running a different AMA
+  // version that serves extra fields trips the shape guard loudly, the
+  // same way the prompt proxy does: publishing the API means new fields
+  // are a deliberate act, on peers too.
+  assert.deepEqual(contract.routes.readPeerMessages, {
+    method: "GET",
+    path: "/api/proxy/{peerHost}/sessions/{name}/message",
+    shape: "agentMessageList",
+  });
+  assert.deepEqual(contract.routes.capturePeerSession, {
+    method: "GET",
+    path: "/api/proxy/{peerHost}/sessions/{target}/capture",
+    shape: "capture",
+  });
+  assert.equal(contract.version, "5", "a change to the published routes is a version bump");
+
+  assert.deepEqual(
+    checkShape("agentMessageList", { messages: [{ id: 7, text: "done", at: 2 }] }, shapeCtx),
+    [],
+  );
+  const messageProblems = checkShape(
+    "agentMessageList",
+    { messages: [{ id: 7, text: "done", at: 2, surprise: 1 }] },
+    shapeCtx,
+  );
+  assert.equal(messageProblems.length, 1);
+  assert.match(messageProblems[0], /surprise/);
+
+  assert.deepEqual(
+    checkShape("capture", { content: "❯ prompt", status: "idle", source: "screen" }, shapeCtx),
+    [],
+  );
 });

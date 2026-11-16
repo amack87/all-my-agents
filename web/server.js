@@ -1701,7 +1701,7 @@ app.get("/api/proxy/:peerHost/sessions/:target/capture", async (req, res) => {
     const peerRes = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
     const data = await peerRes.json();
-    res.json(data);
+    res.status(peerRes.status).json(data);
   } catch {
     res.status(502).json({ error: "Peer request failed" });
   }
@@ -1775,6 +1775,29 @@ app.post("/api/proxy/:peerHost/sessions/:name/send", async (req, res) => {
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify(req.body),
     });
+    const data = await peerRes.json();
+    res.status(peerRes.status).json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
+// Proxy: read the messages an agent on a peer has reported. The peer serves
+// the same shape its own message route serves ({messages: [...]}, oldest
+// first), and `since` is forwarded so the caller's cursor means the same
+// thing here as it does at home.
+app.get("/api/proxy/:peerHost/sessions/:name/message", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const since = req.query.since === undefined
+      ? ""
+      : `?since=${encodeURIComponent(req.query.since)}`;
+    const url = `http://${req.params.peerHost}/api/sessions/${encodeURIComponent(req.params.name)}/message${since}`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const peerRes = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
     const data = await peerRes.json();
     res.status(peerRes.status).json(data);
   } catch {
