@@ -65,8 +65,27 @@ function resolveBaseUrl(env) {
   return `http://127.0.0.1:${env.ALL_MY_AGENTS_PORT ?? 3456}`;
 }
 
-function buildBody(event, token) {
-  return { event, surfaceToken: token };
+// The final response Claude gave the user. Claude Code documents that the
+// Stop (and SubagentStop) hook payload carries `last_assistant_message` —
+// the text content of Claude's final response — so the hook never has to
+// read the transcript file. Blank or malformed fields mean no message.
+function assistantMessage(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const text = payload.last_assistant_message;
+  return typeof text === "string" && text.trim() ? text : null;
+}
+
+// Only the turn's end carries the reply: the `stop` event is the mapped form
+// of Claude's Stop hook, and anything else (a prompt, a tool call) is not the
+// answer to the user's question.
+function messageFor(event, payload) {
+  return event === "stop" ? assistantMessage(payload) : null;
+}
+
+function buildBody(event, token, message) {
+  const body = { event, surfaceToken: token };
+  if (typeof message === "string" && message) body.message = message;
+  return body;
 }
 
 async function readStdin() {
@@ -87,13 +106,15 @@ async function main() {
   const token = resolveToken(globalThis.process?.env);
   if (!event || !token) return;
 
+  const body = buildBody(event, token, messageFor(event, payload));
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
   try {
     await fetch(`${resolveBaseUrl(globalThis.process?.env)}/api/events`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(buildBody(event, token)),
+      headers: {"content-type":"application/json"},
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
   } catch {
@@ -109,4 +130,4 @@ if (isMain) {
   main().catch(() => {}).finally(() => process.exit(0));
 }
 
-export { HOOK_EVENT_MAP, mapHookEvent, resolveToken, resolveBaseUrl, buildBody };
+export { HOOK_EVENT_MAP, mapHookEvent, resolveToken, resolveBaseUrl, assistantMessage, messageFor, buildBody };
