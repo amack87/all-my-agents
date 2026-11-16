@@ -20,6 +20,7 @@ import { buildRestorePlan } from "./restore-plan.js";
 import { indexClaudeSessions, isClaudeSessionId } from "./claude-session-index.js";
 import { detectStatusFromScreen } from "./agent-status.js";
 import { EVENT_TYPES, applyEvent, eventStatus, resolveIdentity } from "./agent-events.js";
+import { createMessageStore } from "./agent-messages.js";
 import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
 import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
 import { isTrustedConnection } from "./network-access.js";
@@ -529,6 +530,10 @@ function saveSidebarGroups(entry) {
 // overrides screen detection while fresh.
 const eventStates = new Map(); // session name or pane id → { status, updatedAt }
 const surfaceTokens = new Map(); // surface token → session name (minted at pane launch)
+// Messages agents report about their own output, keyed by session name. The
+// store is in-memory: a restart loses the history, and the pane capture
+// fallback covers the gap (agent-messages.js, ADR 0013).
+const agentMessages = createMessageStore();
 // Session name → launch spec. The spec is token-free, so it is safe to
 // persist in the registry and re-render after a restart.
 const launchSpecs = new Map();
@@ -933,16 +938,30 @@ app.get("/api/sessions/:target/capture", async (req, res) => {
   }
 });
 
+// Map a session name to its live pane id — the key used by screen detection
+// and the terminal websockets. Null when the session has no live pane. The
+// indirection is a seam: the suite points paneFor at a stub so route tests
+// run without a live tmux pane.
+const paneResolution = {
+  async paneFor(name) {
+    try {
+      const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
+      return out.split("\n")[0]?.trim() || null;
+    } catch { return null; }
+  },
+};
+
 // Accept a canonical lifecycle event from an adapter. Identity must resolve
 // (surface token → registry session id) or the event is rejected unmatched;
 // unknown event names are accepted as no-ops. A fresh event-derived status
 // then overrides screen detection until it goes stale.
 app.post("/api/events", async (req, res) => {
-  const { event, sessionId, surfaceToken } = req.body || {};
+  const { event, sessionId, surfaceToken, message } = req.body || {};
   const malformed =
     typeof event !== "string" || !event ||
     (sessionId !== undefined && (typeof sessionId !== "string" || !sessionId)) ||
-    (surfaceToken !== undefined && (typeof surfaceToken !== "string" || !surfaceToken));
+    (surfaceToken !== undefined && (typeof surfaceToken !== "string" || !surfaceToken)) ||
+    (message !== undefined && typeof message !== "string");
   if (malformed) {
     return res.status(400).json({ error: "Malformed event payload" });
   }
@@ -964,14 +983,18 @@ app.post("/api/events", async (req, res) => {
 
   // Map the registry's session name to a live pane id (the key used by
   // screen detection and the terminal websockets).
-  let paneId = null;
-  try {
-    const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
-    paneId = out.split("\n")[0]?.trim() || null;
-  } catch { /* session gone — treated as unmatched below */ }
+  const paneId = await paneResolution.paneFor(name);
   if (!paneId) {
     return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
   }
+
+  // Agents report their own output: a message the adapter carried is filed
+  // against the session the event resolved to — and only then, so an
+  // unmatched event files nothing. Blank text is no message.
+  const messageId =
+    typeof message === "string" && message.trim()
+      ? agentMessages.file(name, message)
+      : null;
 
   const prev = getEventState(name) || getEventState(paneId);
   const next = applyEvent(prev, event, Date.now());
@@ -982,7 +1005,7 @@ app.post("/api/events", async (req, res) => {
   if (status) {
     broadcastStatus({ type: "status", target: paneId, name, status, source: "event" });
   }
-  log("INFO", "Status event", { name, paneId, event, known, status, changed: (prev?.status ?? null) !== (next?.status ?? null) });
+  log("INFO", "Status event", { name, paneId, event, known, status, changed: (prev?.status ?? null) !== (next?.status ?? null), message: messageId !== null });
   res.json({
     ok: true,
     target: paneId,
@@ -992,6 +1015,29 @@ app.post("/api/events", async (req, res) => {
     status,
     source: status ? "event" : null,
     changed: (prev?.status ?? null) !== (next?.status ?? null),
+    messageId,
+  });
+});
+
+// What an agent has said about its own output, oldest first. Addressable by
+// a cursor: `?since=<id>` returns everything after that id, so a caller can
+// ask for what an agent said since a given point rather than for whatever it
+// last said (ADR 0013). An absent or unparseable cursor means everything.
+// A session that resolves but reported nothing is an empty list — the
+// fallback path for agents that do not report their output — while a name
+// that does not resolve to a live pane is a 404.
+app.get("/api/sessions/:name/message", async (req, res) => {
+  if (!validateTarget(res, req.params.name)) return;
+  const paneId = await paneResolution.paneFor(req.params.name);
+  if (!paneId) {
+    return res.status(404).json({ error: "Unknown session" });
+  }
+  const since = Number.parseInt(req.query.since, 10);
+  res.json({
+    messages: agentMessages.messages(
+      req.params.name,
+      Number.isNaN(since) ? undefined : since,
+    ),
   });
 });
 
@@ -1844,7 +1890,7 @@ function findBridgeAddress() {
 
 const BRIDGE_ADDRESS = findBridgeAddress();
 
-export { app };
+export { app, agentMessages, surfaceTokens, paneResolution };
 if (process.env.NODE_ENV !== "test") {
   // The contract is a public surface: refuse to serve one that lies about a
   // route rather than start with it.

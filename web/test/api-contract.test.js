@@ -201,6 +201,7 @@ test("checkShape follows shape references and null unions", () => {
         status: null,
         source: null,
         changed: false,
+        messageId: null,
       },
       shapeCtx,
     ),
