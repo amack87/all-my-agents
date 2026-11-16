@@ -351,7 +351,7 @@ test("the served vocabulary is the server's own and the shared one", async () =>
 test("the contract publishes the routes a client needs beyond listing sessions", () => {
   // A client that cannot find a route in the contract has to hard-code its
   // path, and a hard-coded path is how the two sides drift apart.
-  for (const name of ["capture", "identity", "targets", "promptSession"]) {
+  for (const name of ["capture", "identity", "targets", "promptSession","promptPeerSession"]) {
     assert.ok(contract.routes[name], `the contract should publish the "${name}" route`);
     assert.ok(
       contract.shapes[contract.routes[name].shape],
@@ -388,4 +388,31 @@ test("the contract publishes the promptSession route and its ack shape", () => {
   const mistyped = checkShape("sendAck", { ok: "yes", name: "work", paneId: "%3" }, shapeCtx);
   assert.equal(mistyped.length, 1);
   assert.match(mistyped[0], /ok/);
+});
+
+test("the contract publishes the promptPeerSession route, and its shape is sendAck", () => {
+  // A client on machine A prompts an agent on machine B through AMA's peer
+  // proxy. The route is published so the client never hard-codes the path,
+  // and the success response is the same ack the local prompt route serves —
+  // so it publishes the same shape. A peer running a different AMA version
+  // that serves extra fields trips the shape guard loudly: publishing the
+  // API means new fields are a deliberate act, on peers too.
+  assert.deepEqual(contract.routes.promptPeerSession, {
+    method: "POST",
+    path: "/api/proxy/{peerHost}/sessions/{name}/send",
+    shape: "sendAck",
+  });
+  assert.equal(contract.version, "4", "a change to the published routes is a version bump");
+
+  assert.deepEqual(
+    checkShape("sendAck", { ok: true, name: "work", paneId: "%3" }, shapeCtx),
+    [],
+  );
+  const problems = checkShape(
+    "sendAck",
+    { ok: true, name: "work", paneId: "%3", surprise: 1 },
+    shapeCtx,
+  );
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /surprise/);
 });

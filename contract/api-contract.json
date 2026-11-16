@@ -1,6 +1,6 @@
 {
   "note": "AMA's published API contract: the status vocabulary, the routes a client may call, and the shape of what those routes return. The server builds the document it serves at GET /api/contract from its own vocabulary and route table, and its suite asserts the served document matches this fixture — so a change to either surfaces as a test failure, not as a difference. A client fetches this document rather than assuming it, and keeps a vendored copy as its fallback. Changing this contract's content is a change to a public surface: bump `version` in the same commit, and update the client's vendored copy.",
-  "version": "3",
+  "version": "4",
   "statuses": {
     "vocabulary": ["needsInput", "working", "idle", "ended", "unknown"],
     "working": ["working"],
@@ -17,6 +17,7 @@
     "identity": { "method": "GET", "path": "/api/identity", "shape": "identity" },
     "targets": {"method":"GET","path":"/api/targets","shape":"targetList"},
     "promptSession": {"method":"POST","path":"/api/sessions/{name}/send","shape":"sendAck"},
+    "promptPeerSession": {"method":"POST","path":"/api/proxy/{peerHost}/sessions/{name}/send","shape":"sendAck"},
     "agentMessage": {"method":"GET","path":"/api/sessions/{name}/message","shape":"agentMessageList"}
   },
   "shapes": {
