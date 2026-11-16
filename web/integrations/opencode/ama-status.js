@@ -74,11 +74,54 @@ function resolveToken(env) {
 }
 
 // The body AMA's event endpoint accepts: an event, the session it is about,
-// and the surface token when the agent has one.
-function buildBody(event, sessionId, token) {
+// the surface token when the agent has one, and the assistant's reply when
+// the event ends a turn. The message stays OPTIONAL: an adapter that cannot
+// supply one (or an event that is not a reply) sends the same body it always
+// did — the same rule the Claude Code hook follows.
+function buildBody(event, sessionId, token, message) {
   const body = { event, sessionId };
   if (token) body.surfaceToken = token;
+  if (typeof message === "string" && message) body.message = message;
   return body;
+}
+
+// The text of an assistant's reply, read straight out of the message the bus
+// already carries. Only assistant messages have a reply, and only their text
+// parts are speech; blank or malformed fields mean no message — the same
+// rule the Claude Code hook applies to `last_assistant_message`.
+function assistantText(info) {
+  if (!info || info.role !== "assistant" || !Array.isArray(info.parts)) return null;
+  const text = info.parts
+    .filter((part) => part?.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("\n\n");
+  return text.trim() ? text : null;
+}
+
+// Replies are remembered between events: the bus reports the assistant's
+// message while it streams, but the turn ends on a different event
+// (session.idle → stop). opencode publishes the completed message BEFORE the
+// session goes idle, so the text observed last is the reply the stop event
+// carries. Taken once, then forgotten — a reply belongs to one turn.
+function createReplyTracker() {
+  const replies = new Map();
+  return {
+    observe(busEvent) {
+      const properties = busEvent?.properties;
+      if (properties?.info?.role !== "assistant") return;
+      const text = assistantText(properties.info);
+      const sessionId = sessionIdFromBusProps(busEvent);
+      if (sessionId && text) replies.set(sessionId, text);
+    },
+    take(sessionId) {
+      const text = replies.get(sessionId);
+      replies.delete(sessionId);
+      return text ?? null;
+    },
+    forget(sessionId) {
+      replies.delete(sessionId);
+    },
+  };
 }
 
 export const AmaStatusPlugin = async () => {
@@ -88,15 +131,16 @@ export const AmaStatusPlugin = async () => {
 
   const started = new Set();
   const chains = new Map();
+  const replies = createReplyTracker();
 
-  async function post(event, sessionId) {
+  async function post(event, sessionId, message) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), POST_TIMEOUT_MS);
     try {
       await fetch(`${baseUrl}/api/events`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(buildBody(event, sessionId, token)),
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(buildBody(event, sessionId, token, message)),
         signal: controller.signal,
       });
     } catch {
@@ -106,14 +150,14 @@ export const AmaStatusPlugin = async () => {
     }
   }
 
-  function enqueue(sessionId, event) {
+  function enqueue(sessionId, event, message) {
     const previous = chains.get(sessionId) ?? Promise.resolve();
-    const next = previous.then(() => post(event, sessionId)).catch(() => {});
+    const next = previous.then(() => post(event, sessionId, message)).catch(() => {});
     chains.set(sessionId, next);
     return next;
   }
 
-  function emit(sessionId, event) {
+  function emit(sessionId, event, message) {
     if (!sessionId || !event) return;
 
     if (event === "sessionStart") {
@@ -127,6 +171,7 @@ export const AmaStatusPlugin = async () => {
     if (event === "sessionEnd") {
       if (started.has(sessionId)) {
         started.delete(sessionId);
+        replies.forget(sessionId);
         enqueue(sessionId, "sessionEnd");
       }
       return;
@@ -138,14 +183,25 @@ export const AmaStatusPlugin = async () => {
       started.add(sessionId);
       enqueue(sessionId, "sessionStart");
     }
-    enqueue(sessionId, event);
+    enqueue(sessionId, event, message);
   }
 
   return {
     event: async ({ event }) => {
+      // The assistant's reply is observed from the message bus itself: opencode
+      // reports the completed message just before the session goes idle, so
+      // the stop event this adapter already sends carries it — the same shape
+      // Claude Code's Stop hook produces.
+      if (event?.type === "message.updated") {
+        replies.observe(event);
+        return;
+      }
       const canonical = canonicalBusEvent(event?.type);
       if (!canonical) return;
-      emit(sessionIdFromBusProps(event), canonical);
+      const sessionId = sessionIdFromBusProps(event);
+      const message = canonical === "stop" ? replies.take(sessionId) : null;
+      if (canonical === "sessionStart") replies.forget(sessionId);
+      emit(sessionId, canonical, message);
     },
     "chat.message": async (input) => {
       emit(input?.sessionID, HOOK_EVENTS["chat.message"]);
@@ -172,6 +228,8 @@ AmaStatusPlugin.helpers = {
   resolveBaseUrl,
   resolveToken,
   buildBody,
+  assistantText,
+  createReplyTracker,
   HOOK_EVENTS,
 };
 

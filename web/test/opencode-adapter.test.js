@@ -3,8 +3,16 @@ import assert from "node:assert/strict";
 
 import { AmaStatusPlugin } from "../integrations/opencode/ama-status.js";
 
-const { canonicalBusEvent, sessionIdFromBusProps, resolveBaseUrl, resolveToken, buildBody, HOOK_EVENTS } =
-  AmaStatusPlugin.helpers;
+const {
+  canonicalBusEvent,
+  sessionIdFromBusProps,
+  resolveBaseUrl,
+  resolveToken,
+  buildBody,
+  assistantText,
+  createReplyTracker,
+  HOOK_EVENTS,
+} = AmaStatusPlugin.helpers;
 
 test("bus events map to the canonical status vocabulary", () => {
   assert.equal(canonicalBusEvent("session.created"), "sessionStart");
@@ -107,5 +115,118 @@ test("the event body omits the surface token when there is none", () => {
   assert.deepEqual(buildBody("working", "ses_1", null), {
     event: "working",
     sessionId: "ses_1",
+  });
+});
+
+test("an assistant message's text parts become the reply", () => {
+  const info = {
+    role: "assistant",
+    parts: [
+      { type: "text", text: "here is" },
+      { type: "tool", tool: "bash", state: { status: "completed" } },
+      { type: "text", text: "the answer" },
+    ],
+  };
+  assert.equal(assistantText(info), "here is\n\nthe answer");
+});
+
+test("a message with nothing to say carries no reply", () => {
+  assert.equal(assistantText({ role: "user", parts: [{ type: "text", text: "hi" }] }), null);
+  assert.equal(assistantText({ role: "assistant", parts: [] }), null);
+  assert.equal(assistantText({ role: "assistant", parts: [{ type: "text", text: "   " }] }), null);
+  assert.equal(assistantText({}), null);
+  assert.equal(assistantText(undefined), null);
+});
+
+test("the tracker remembers the last assistant reply from message.updated", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { role: "assistant", parts: [{ type: "text", text: "the reply" }] },
+    },
+  });
+  assert.equal(tracker.take("ses_1"), "the reply");
+});
+
+test("the tracker's reply is taken once, then forgotten", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { role: "assistant", parts: [{ type: "text", text: "the reply" }] },
+    },
+  });
+  assert.equal(tracker.take("ses_1"), "the reply");
+  assert.equal(tracker.take("ses_1"), null);
+});
+
+test("the tracker keeps sessions apart", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { role: "assistant", parts: [{ type: "text", text: "for one" }] },
+    },
+  });
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_2",
+      info: { role: "assistant", parts: [{ type: "text", text: "for two" }] },
+    },
+  });
+  assert.equal(tracker.take("ses_2"), "for two");
+  assert.equal(tracker.take("ses_1"), "for one");
+});
+
+test("user messages and unknown sessions carry no reply", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { role: "user", parts: [{ type: "text", text: "the prompt" }] },
+    },
+  });
+  assert.equal(tracker.take("ses_1"), null);
+  assert.equal(tracker.take("ses_9"), null);
+});
+
+test("the tracker forgets a session on request", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { role: "assistant", parts: [{ type: "text", text: "the reply" }] },
+    },
+  });
+  tracker.forget("ses_1");
+  assert.equal(tracker.take("ses_1"), null);
+});
+
+test("the stop event body carries the reply when there is one", () => {
+  assert.deepEqual(buildBody("stop", "ses_1", "abc123", "the reply"), {
+    event: "stop",
+    sessionId: "ses_1",
+    surfaceToken: "abc123",
+    message: "the reply",
+  });
+});
+
+test("the event body omits the message when there is none", () => {
+  assert.deepEqual(buildBody("stop", "ses_1", "abc123", null), {
+    event: "stop",
+    sessionId: "ses_1",
+    surfaceToken: "abc123",
+  });
+  assert.deepEqual(buildBody("working", "ses_1", "abc123"), {
+    event: "working",
+    sessionId: "ses_1",
+    surfaceToken: "abc123",
   });
 });
