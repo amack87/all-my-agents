@@ -1760,7 +1760,27 @@ app.post("/api/proxy/:peerHost/sessions/:name/rename", async (req, res) => {
   }
 });
 
-// WebSocket proxy: terminal on a peer machine
+// Proxy: deliver a prompt to a session on a peer. Same ack the local send
+// route serves ({ok, name, paneId}); the peer validates the body and resolves
+// the session, so unknown sessions and bad bodies come back with the peer's
+// own status and error body.
+app.post("/api/proxy/:peerHost/sessions/:name/send", async (req, res) => {
+  const config = await resolveConfig();
+  if (!validatePeerHost(res, req.params.peerHost, config)) return;
+
+  try {
+    const url = `http://${req.params.peerHost}/api/sessions/${encodeURIComponent(req.params.name)}/send`;
+    const peerRes = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(req.body),
+    });
+    const data = await peerRes.json();
+    res.status(peerRes.status).json(data);
+  } catch {
+    res.status(502).json({ error: "Peer request failed" });
+  }
+});
 app.ws("/ws/proxy/:peerHost/:target", (clientWs, req) => {
   const peerHost = req.params.peerHost;
   const target = req.params.target;
