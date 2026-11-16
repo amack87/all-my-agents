@@ -350,11 +350,41 @@ test("the served vocabulary is the server's own and the shared one", async () =>
 test("the contract publishes the routes a client needs beyond listing sessions", () => {
   // A client that cannot find a route in the contract has to hard-code its
   // path, and a hard-coded path is how the two sides drift apart.
-  for (const name of ["capture", "identity", "targets"]) {
+  for (const name of ["capture", "identity", "targets", "promptSession"]) {
     assert.ok(contract.routes[name], `the contract should publish the "${name}" route`);
     assert.ok(
       contract.shapes[contract.routes[name].shape],
       `the "${name}" route's shape should be declared`,
     );
   }
+});
+
+test("the contract publishes the promptSession route and its ack shape", () => {
+  // A client prompts a session by name; the route is a deliberate surface,
+  // published so the client never hard-codes the path.
+  assert.deepEqual(contract.routes.promptSession, {
+    method: "POST",
+    path: "/api/sessions/{name}/send",
+    shape: "sendAck",
+  });
+
+  // The success response the route serves keeps the shape it publishes:
+  // exactly ok, name and paneId, nothing more.
+  assert.deepEqual(
+    checkShape("sendAck", { ok: true, name: "work", paneId: "%3" }, shapeCtx),
+    [],
+  );
+  // An extra field is a problem, as everywhere else — publishing the API
+  // means new fields are a deliberate act.
+  const problems = checkShape(
+    "sendAck",
+    { ok: true, name: "work", paneId: "%3", surprise: 1 },
+    shapeCtx,
+  );
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /surprise/);
+  // A wrong-typed declared field is a problem too.
+  const mistyped = checkShape("sendAck", { ok: "yes", name: "work", paneId: "%3" }, shapeCtx);
+  assert.equal(mistyped.length, 1);
+  assert.match(mistyped[0], /ok/);
 });

@@ -21,6 +21,7 @@ import { indexClaudeSessions, isClaudeSessionId } from "./claude-session-index.j
 import { detectStatusFromScreen } from "./agent-status.js";
 import { EVENT_TYPES, applyEvent, eventStatus, resolveIdentity } from "./agent-events.js";
 import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
+import { validateSendBody, sendPromptCalls } from "./send-prompt.js";
 import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
 import { isTrustedConnection } from "./network-access.js";
 import { pickWinner, sanitizeSidebarOrder } from "./public/sidebar-sync.js";
@@ -904,6 +905,36 @@ app.post("/api/sessions/:name/rename", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Deliver a prompt to a session: type the text into the session's pane as the
+// agent's own input, then press Enter. An unknown session (no live pane
+// resolves for the name) is 404; a body without a non-empty text is 400.
+app.post("/api/sessions/:name/send", async (req, res) => {
+  const body = validateSendBody(req.body);
+  if (!body.ok) {
+    return res.status(400).json({ error: body.error });
+  }
+  if (!validateTarget(res, req.params.name)) return;
+  const name = req.params.name;
+  let paneId = null;
+  try {
+    const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
+    paneId = out.split("\n")[0]?.trim() || null;
+  } catch { /* no such session — reported as unknown below */ }
+  if (!paneId) {
+    return res.status(404).json({ error: `Unknown session: ${name}` });
+  }
+  const timeoutMs = 5000;
+  try {
+    for (const args of sendPromptCalls(paneId, body.text)) {
+      await execFileAsync(TMUX, args, { timeout: timeoutMs });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: redactTokens(err.message) });
+  }
+  log("INFO", "Prompt sent", { name, paneId });
+  res.json({ ok: true, name, paneId });
 });
 
 // Kill a tmux session
