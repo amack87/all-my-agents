@@ -6,6 +6,8 @@ import {
   mapHookEvent,
   resolveToken,
   resolveBaseUrl,
+  assistantMessage,
+  messageFor,
   buildBody,
 } from "../integrations/claude/ama-status-hook.js";
 
@@ -63,6 +65,39 @@ test("the body carries the surface token and never Claude's own session id", () 
   const body = buildBody("toolStart", "tok_2");
   assert.equal("sessionId" in body, false);
   assert.equal("session_id" in body, false);
+});
+
+test("a Stop hook's final response is carried as the message", () => {
+  const text = "The build passes and the tests are green.";
+  assert.equal(assistantMessage({ last_assistant_message: text }), text);
+});
+
+test("a Stop hook with nothing to say carries no message", () => {
+  // Claude's Stop payload always has the field per its docs, but a hook must
+  // never invent content out of an empty, missing or malformed field.
+  assert.equal(assistantMessage({}), null);
+  assert.equal(assistantMessage({ last_assistant_message: "" }), null);
+  assert.equal(assistantMessage({ last_assistant_message: "   " }), null);
+  assert.equal(assistantMessage({ last_assistant_message: 42 }), null);
+  assert.equal(assistantMessage(null), null);
+});
+
+test("only the stop event carries the final response", () => {
+  // SubagentStop also has last_assistant_message, but it does not map to a
+  // canonical event and is ignored; a prompt or tool event is not the reply.
+  assert.equal(messageFor("stop", { last_assistant_message: "the reply" }), "the reply");
+  assert.equal(messageFor("stop", {}), null);
+  assert.equal(messageFor("toolStart", { last_assistant_message: "the reply" }), null);
+  assert.equal(messageFor("stop", null), null);
+});
+
+test("the POST body carries the message text when there is one", () => {
+  assert.deepEqual(
+    buildBody("stop", "tok_3", "the reply"),
+    { event: "stop", surfaceToken: "tok_3", message: "the reply" },
+  );
+  assert.deepEqual(buildBody("stop", "tok_3", null), { event: "stop", surfaceToken: "tok_3" });
+  assert.deepEqual(buildBody("stop", "tok_3"), { event: "stop", surfaceToken: "tok_3" });
 });
 
 test("the mapping table is exactly the canonical set Claude can produce", () => {
