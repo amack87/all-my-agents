@@ -18,6 +18,7 @@ Ubiquitous language for All My Agents. Definitions only — no implementation de
 - **Contract** — the machine-readable description of AMA's API: the status vocabulary, the routes a client may call, and the shape of what those routes return. A client fetches the contract rather than assuming it, so a change in AMA cannot drift past a client unnoticed.
 - **Agent message** — the text an agent produced, reported by the agent itself rather than read off its screen, and filed against the session its surface token identifies.
 - **Voice bridge** — a separate application that owns the microphone, the speech in and the spoken reply, and drives AMA's sessions through AMA's API. AMA itself has no voice interface.
+- **Terminal palette** — the fixed dark colours every AMA terminal paints with, whatever the host's appearance is. An agent reads the terminal's background and themes itself to match, so the palette is a shared fact between AMA and the agent in the pane, not a local style choice.
 
 ## Sidebar arrangement
 

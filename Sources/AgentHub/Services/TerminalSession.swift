@@ -20,8 +20,7 @@ final class TerminalSession {
         view.processDelegate = self
 
         view.font = FontFactory.terminalFont(size: fontSize)
-        view.nativeForegroundColor = .textColor
-        view.nativeBackgroundColor = .textBackgroundColor
+        TerminalPalette.apply(to: view)
 
         let tmux = TmuxHelpers.tmuxPath()
 
