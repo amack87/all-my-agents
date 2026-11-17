@@ -52,6 +52,7 @@ SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ./build.sh
 - **Swift concurrency**: Use `DispatchQueue.global` (not async Task) for running `Process` objects that do blocking I/O. Swift's cooperative thread pool deadlocks when all threads block on `waitUntilExit()`.
 - **Immutability**: All state updates must create new objects. Never mutate arrays or models in place. See NotificationStore's copy/upsert patterns.
 - **tmux-attach-helper**: Required because SwiftTerm uses `POSIX_SPAWN_SETSID` without `TIOCSCTTY`. The C helper establishes a controlling terminal before exec'ing tmux. Must be compiled and placed in `Contents/MacOS/`.
+- **Fixed terminal palette**: The app's terminals use one fixed palette (`TerminalPalette`) — background `#0A0A0A`, foreground `#E6E6E6` — and never follow the macOS appearance. An agent reads the terminal background over OSC 11 and picks a theme to match, so a terminal that answers "white" makes the agent paint a white pane over everything. Do not swap the palette for `.textBackgroundColor` / `.textColor`. See `docs/adr/0014-the-terminal-has-a-fixed-dark-palette.md`.
 
 ## Architecture Overview
 

@@ -27,8 +27,7 @@ final class WebSocketTerminalSession: NSObject {
         view.terminalDelegate = self
 
         view.font = FontFactory.terminalFont(size: fontSize)
-        view.nativeForegroundColor = .textColor
-        view.nativeBackgroundColor = .textBackgroundColor
+        TerminalPalette.apply(to: view)
 
         terminalView = view
 
