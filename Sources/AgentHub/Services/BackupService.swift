@@ -118,9 +118,57 @@ final class BackupService {
     }
 
     /// Hibernate the given idle sessions. Used when the app quits.
+    /// Before hibernating, discovers Claude session IDs so they can be used
+    /// for faithful restoration via `claude --resume <uuid>`.
     @discardableResult
     func hibernateOnQuit(sessionNames: [String]) -> [String] {
         guard settings.hibernateOnShutdown, HibernatorService.isAvailable else { return [] }
+
+        // Discover Claude session IDs before hibernating
+        var sessionIdMap: [String: String] = [:]  // sessionName -> sessionId
+        for name in sessionNames {
+            if let sessionId = ClaudeSessionIndex.sessionId(forTmuxSession: name) {
+                sessionIdMap[name] = sessionId
+            }
+        }
+
+        // If we found session IDs, write them to a sidecar file for the restore path
+        if !sessionIdMap.isEmpty {
+            writeSessionIdMap(sessionIdMap)
+        }
+
         return HibernatorService.hibernateSynchronously(sessionNames: sessionNames)
+    }
+
+    /// Path to the sidecar file that stores session IDs for hibernated sessions.
+    private var sessionIdMapPath: URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("AllMyAgents", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("hibernated-session-ids.json")
+    }
+
+    /// Write session IDs to a sidecar file so the restore path can find them.
+    private func writeSessionIdMap(_ map: [String: String]) {
+        do {
+            let data = try JSONEncoder().encode(map)
+            try data.write(to: sessionIdMapPath)
+        } catch {
+            // Best effort - the restore will fall back to context pipe
+        }
+    }
+
+    /// Read session IDs from the sidecar file.
+    func readSessionIdMap() -> [String: String] {
+        guard let data = try? Data(contentsOf: sessionIdMapPath),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return map
+    }
+
+    /// Clear the session ID map (called after successful restore).
+    func clearSessionIdMap() {
+        try? FileManager.default.removeItem(at: sessionIdMapPath)
     }
 }

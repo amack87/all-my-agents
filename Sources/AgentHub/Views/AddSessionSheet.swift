@@ -426,52 +426,147 @@ struct AddSessionSheet: View {
         errorMessage = nil
 
         Task {
-            let output = await HibernatorService.run([
-                "restore", "--json", session.sessionName
-            ])?.output
+            // If we have a session UUID, try to restore with `claude --resume`
+            // This preserves the full conversation instead of the thin context.
+            if let sessionUUID = session.claudeSessionUUID {
+                await restoreWithSessionId(session: session, sessionUUID: sessionUUID)
+            } else {
+                await restoreWithHibernator(session: session)
+            }
+        }
+    }
 
+    /// Restore a hibernated session using `claude --resume <uuid>`.
+    /// This preserves the full conversation.
+    private func restoreWithSessionId(session: HibernatedSession, sessionUUID: String) async {
+        let name = session.sessionName
+
+        // Check if the session already exists (might have been revived externally)
+        let checkOutput = await TmuxHelpers.run(arguments: ["has-session", "-t", name])
+        let sessionExists = checkOutput != nil
+
+        if !sessionExists {
+            // Create a new tmux session
+            let createOutput = await TmuxHelpers.run(arguments: [
+                "new-session", "-d", "-s", name, "-c", session.workingDirectory
+            ])
+
+            guard createOutput != nil else {
+                await MainActor.run {
+                    errorMessage = "Failed to create tmux session"
+                    isRestoring = nil
+                }
+                return
+            }
+        }
+
+        // Get the pane ID for this session
+        let paneOutput = await TmuxHelpers.run(arguments: [
+            "list-panes", "-t", name, "-F", "#{pane_id}"
+        ])
+        guard let paneId = paneOutput?.components(separatedBy: "\n").first(where: { !$0.isEmpty }) else {
             await MainActor.run {
+                errorMessage = "Could not find pane for session"
                 isRestoring = nil
+            }
+            return
+        }
 
-                guard let output else {
-                    errorMessage = "Failed to run hibernator"
-                    return
-                }
+        // Send the resume command to the pane
+        let resumeCommand = "~/.local/bin/claude --resume \(sessionUUID)"
+        let sendOutput = await TmuxHelpers.run(arguments: [
+            "send-keys", "-t", "\(name):\(paneId)", resumeCommand, "C-m"
+        ])
 
-                // Parse JSON response
-                guard let data = output.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let success = json["success"] as? Bool,
-                      success else {
-                    let errMsg = parseRestoreError(output)
-                    errorMessage = errMsg ?? "Restore failed"
-                    return
-                }
+        await MainActor.run {
+            isRestoring = nil
 
-                let name = session.sessionName
-                store.unhideSession(named: name)
-                store.setPendingSession(named: name)
+            if sendOutput == nil {
+                errorMessage = "Failed to send resume command"
+                return
+            }
 
-                let restoredSession = ClaudeSession(
-                    id: "tmux-pending-\(name)",
-                    pid: 0,
-                    tty: "",
-                    sessionUUID: nil,
-                    tmuxPane: nil,
-                    tmuxSession: name,
-                    projectPath: nil,
-                    summary: nil,
-                    agent: "shell",
-                    status: .idle,
-                    lastSeen: Date(),
-                    lastActivity: nil,
-                    machine: nil,
-                    machineHost: nil
-                )
-                dismiss()
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    onSelectSession(restoredSession)
-                }
+            // Clear the session ID map entry since we restored it
+            BackupService.shared.clearSessionIdMap()
+
+            // Add session to the store
+            store.unhideSession(named: name)
+            store.setPendingSession(named: name)
+
+            let restoredSession = ClaudeSession(
+                id: sessionUUID,
+                pid: 0,
+                tty: "",
+                sessionUUID: sessionUUID,
+                tmuxPane: paneId,
+                tmuxSession: name,
+                projectPath: session.workingDirectory,
+                summary: nil,
+                agent: "Claude Code",
+                status: .idle,
+                lastSeen: Date(),
+                lastActivity: nil,
+                machine: nil,
+                machineHost: nil
+            )
+            dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                onSelectSession(restoredSession)
+            }
+        }
+    }
+
+    /// Restore a hibernated session using the hibernator CLI (fallback when no UUID).
+    /// This restores a thin context, not the full conversation.
+    private func restoreWithHibernator(session: HibernatedSession) async {
+        let output = await HibernatorService.run([
+            "restore", "--json", session.sessionName
+        ])?.output
+
+        await MainActor.run {
+            isRestoring = nil
+
+            guard let output else {
+                errorMessage = "Failed to run hibernator"
+                return
+            }
+
+            // Parse JSON response
+            guard let data = output.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let success = json["success"] as? Bool,
+                  success else {
+                let errMsg = parseRestoreError(output)
+                errorMessage = errMsg ?? "Restore failed"
+                return
+            }
+
+            // Clear the session ID map entry (might be stale)
+            BackupService.shared.clearSessionIdMap()
+
+            let name = session.sessionName
+            store.unhideSession(named: name)
+            store.setPendingSession(named: name)
+
+            let restoredSession = ClaudeSession(
+                id: "tmux-pending-\(name)",
+                pid: 0,
+                tty: "",
+                sessionUUID: nil,
+                tmuxPane: nil,
+                tmuxSession: name,
+                projectPath: nil,
+                summary: nil,
+                agent: "shell",
+                status: .idle,
+                lastSeen: Date(),
+                lastActivity: nil,
+                machine: nil,
+                machineHost: nil
+            )
+            dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                onSelectSession(restoredSession)
             }
         }
     }
@@ -493,7 +588,9 @@ struct AddSessionSheet: View {
                     hibernatedSessions = []
                     return
                 }
-                hibernatedSessions = HibernatedSession.parse(json: output)
+                // Load session IDs from the sidecar file created at hibernate time
+                let sessionIdMap = BackupService.shared.readSessionIdMap()
+                hibernatedSessions = HibernatedSession.parse(json: output, sessionIdMap: sessionIdMap)
             }
         }
     }
@@ -526,6 +623,9 @@ struct HibernatedSession: Identifiable {
     let sessionName: String
     let workingDirectory: String
     let hibernatedAt: String
+    /// The Claude session UUID, if captured at hibernate time.
+    /// Enables faithful resume via `claude --resume <uuid>`.
+    var claudeSessionUUID: String?
 
     var displayDate: String {
         // "2026-03-17T03:16:58.617202+00:00" -> "Mar 17 03:16"
@@ -539,7 +639,7 @@ struct HibernatedSession: Identifiable {
         return (path as NSString).lastPathComponent
     }
 
-    static func parse(json: String) -> [HibernatedSession] {
+    static func parse(json: String, sessionIdMap: [String: String] = [:]) -> [HibernatedSession] {
         guard let data = json.data(using: .utf8),
               let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return []
@@ -551,11 +651,15 @@ struct HibernatedSession: Identifiable {
                 return nil
             }
             let workDir = dict["working_directory"] as? String ?? ""
+            let capturedUUID = dict["claude_session_uuid"] as? String
+            // Prefer captured UUID, fall back to what's in sessionIdMap (from sidecar file)
+            let sessionUUID = capturedUUID ?? sessionIdMap[name]
             return HibernatedSession(
                 id: id,
                 sessionName: name,
                 workingDirectory: workDir,
-                hibernatedAt: hibernatedAt
+                hibernatedAt: hibernatedAt,
+                claudeSessionUUID: sessionUUID
             )
         }
     }
