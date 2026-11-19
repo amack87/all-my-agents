@@ -176,9 +176,16 @@ struct SessionSidebarView: View {
                             showRenameGroupAlert = true
                         }
                         if !group.isCollapsed {
-                            ForEach(group.sessions) { session in
-                                sessionTile(session, group: group.name)
+                            VStack(spacing: 0) {
+                                ForEach(group.sessions) { session in
+                                    sessionTile(session, group: group.name)
+                                }
                             }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(Color.primary.opacity(0.04))
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            .padding(.horizontal, 4)
                         }
                     }
                     ForEach(store.ungroupedSessions) { session in
