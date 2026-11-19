@@ -247,6 +247,7 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
         projectPath: s.projectPath ? String(s.projectPath) : undefined,
         summary: s.summary ? String(s.summary) : undefined,
         lastActivity: typeof s.lastActivity === "number" ? s.lastActivity : 0,
+        task: typeof s.task === "string" ? s.task : null,
         machine: peer.name,
         machineHost: `${peer.host}:${peer.port || DEFAULT_PORT}`,
       })),

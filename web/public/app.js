@@ -9,6 +9,7 @@ import { moveSession, moveGroup, resolveOrder } from "./session-order.js";
 import { pickWinner, isSafeGroupName, sanitizeSidebarOrder } from "./sidebar-sync.js";
 import { resizeFrame, claimFrame, CLAIM_HEARTBEAT_MS, shouldHeartbeat, isTouched } from "./terminal-size.js";
 import { esc } from "./escape.js";
+import { taskHtml } from "./session-task.js";
 import { statusLabel } from "./session-status.js";
 
 // --- Theme Helpers ---
@@ -606,6 +607,7 @@ function renderSessionCard(s, showMachineLabel) {
           <span class="session-status-label ${s.status}">${statusLabel(s.status)}</span>
         </div>
         <div class="session-bottom-row">
+          ${taskHtml(s.task)}
           <span class="session-agent">${esc(s.agent || "shell")}</span>
           ${isInterestingCommand(s.currentCommand, s.agent) ? `<span class="session-command">${esc(s.currentCommand)}</span>` : ""}
           ${s.projectPath ? `<span class="session-project">${esc(s.projectPath)}</span>` : ""}

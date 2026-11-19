@@ -20,6 +20,7 @@ enum MeshAPIClient {
         let lastActivity: Int?
         let machine: String?
         let machineHost: String?
+        let task: String?
     }
 
     /// Fetch sessions from the web server. Returns nil if the server is unreachable or returns invalid data.
@@ -71,7 +72,8 @@ enum MeshAPIClient {
                 lastSeen: Date(),
                 lastActivity: activity,
                 machine: s.machine,
-                machineHost: s.machineHost
+                machineHost: s.machineHost,
+                task: s.task
             )
         }
     }

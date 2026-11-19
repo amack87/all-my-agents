@@ -1,0 +1,90 @@
+{
+  "note": "Task state update contract. The web server canonicalises a task update — trimmed, bounded in length, empty becomes null — and both apps carry the canonical task verbatim. The server never escapes a task and never rewords it; the renderer escapes. The canonicalisation cases are asserted by web/test/task-contract.test.js against web/task.js. The wire tasks are asserted by both suites: web/test/task-contract.test.js and Tests/AllMyAgentsTests/TaskContractTests.swift.",
+  "rules": {
+    "maxLength": 200,
+    "trim": true,
+    "emptyIsNull": true,
+    "absentKeepsPrevious": true
+  },
+  "cases": [
+    {
+      "name": "task present with valid string value",
+      "input": { "task": "Build feature X" },
+      "expected": { "task": "Build feature X", "effect": "set" }
+    },
+    {
+      "name": "task present with null value",
+      "input": { "task": null },
+      "expected": { "task": null, "effect": "clear" }
+    },
+    {
+      "name": "task missing entirely (undefined)",
+      "input": {},
+      "expected": { "task": null, "effect": "keep" }
+    },
+    {
+      "name": "task present with empty string",
+      "input": { "task": "" },
+      "expected": { "task": null, "effect": "clear" }
+    },
+    {
+      "name": "task present with whitespace-only string",
+      "input": { "task": "   " },
+      "expected": { "task": null, "effect": "clear" }
+    },
+    {
+      "name": "surrounding whitespace is trimmed",
+      "input": { "task": "  Build feature X  " },
+      "expected": { "task": "Build feature X", "effect": "set" }
+    },
+    {
+      "name": "mixed update with task and other fields",
+      "input": { "task": "Run tests", "status": "working", "progress": 50 },
+      "expected": { "task": "Run tests", "effect": "set" }
+    },
+    {
+      "name": "updating task to null",
+      "input": { "task": null },
+      "expected": { "task": null, "effect": "clear" }
+    },
+    {
+      "name": "a script tag is carried verbatim",
+      "input": { "task": "<script>alert(1)</script>" },
+      "expected": { "task": "<script>alert(1)</script>", "effect": "set" }
+    },
+    {
+      "name": "an attribute break-out is carried verbatim",
+      "input": { "task": "\"><img src=x onerror=alert(1)>" },
+      "expected": { "task": "\"><img src=x onerror=alert(1)>", "effect": "set" }
+    },
+    {
+      "name": "an ampersand is carried verbatim",
+      "input": { "task": "a & b" },
+      "expected": { "task": "a & b", "effect": "set" }
+    },
+    {
+      "name": "quotes are carried verbatim",
+      "input": { "task": "it's \"quoted\"" },
+      "expected": { "task": "it's \"quoted\"", "effect": "set" }
+    },
+    {
+      "name": "markup is carried verbatim",
+      "input": { "task": "<b>bold</b>" },
+      "expected": { "task": "<b>bold</b>", "effect": "set" }
+    },
+    {
+      "name": "a task longer than the cap is truncated",
+      "inputLength": 250,
+      "expected": { "taskLength": 200, "effect": "set" }
+    }
+  ],
+  "wireTasks": [
+    "Build feature X",
+    "Run tests",
+    "<script>alert(1)</script>",
+    "\"><img src=x onerror=alert(1)>",
+    "a & b",
+    "it's \"quoted\"",
+    "<b>bold</b>"
+  ]
+}

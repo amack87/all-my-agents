@@ -349,6 +349,12 @@ struct SessionRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                if let task = session.task, !task.isEmpty {
+                    Text(task)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             Spacer()
         }

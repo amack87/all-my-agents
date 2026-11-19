@@ -27,13 +27,15 @@ struct StatusFeedClientTests {
         {"type":"sessions","peerStatus":{},"sessions":[
           {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"claude",
            "status":"needsInput","source":"event","agent":"Claude Code","projectPath":"/tmp/alpha",
-           "summary":"a summary","lastActivity":1794595437,"machine":"andys-macbook-pro","machineHost":"local"}
+           "summary":"a summary","lastActivity":1794595437,"machine":"andys-macbook-pro","machineHost":"local",
+           "task":"Build feature X"}
         ]}
         """
         let sessions = try #require(StatusFeedClient.decodeSnapshot(Data(payload.utf8)))
         #expect(sessions.count == 1)
         let session = try #require(sessions.first)
         #expect(session.tmuxSession == "alpha")
+        #expect(session.task == "Build feature X")
         #expect(session.tmuxPane == "%1")
         #expect(session.agent == "Claude Code")
         #expect(session.status == .needsInput)
@@ -75,13 +77,15 @@ struct StatusFeedClientTests {
             summary: "a summary",
             lastActivity: 1794595437,
             machine: "andys-macbook-pro",
-            machineHost: "local"
+            machineHost: "local",
+            task: "Build feature X"
         )
         let fromHTTP = MeshAPIClient.mapSessions([mesh])
         let payload = """
         {"type":"sessions","sessions":[
           {"name":"alpha","paneId":"%1","status":"ended","agent":"Claude Code","projectPath":"/tmp/alpha",
-           "summary":"a summary","lastActivity":1794595437,"machine":"andys-macbook-pro","machineHost":"local"}
+           "summary":"a summary","lastActivity":1794595437,"machine":"andys-macbook-pro","machineHost":"local",
+           "task":"Build feature X"}
         ]}
         """
         let fromFeed = try #require(StatusFeedClient.decodeSnapshot(Data(payload.utf8)))
@@ -111,7 +115,8 @@ struct StatusFeedClientTests {
             summary: nil,
             lastActivity: nil,
             machine: nil,
-            machineHost: nil
+            machineHost: nil,
+            task: nil
         )
         let sessions = MeshAPIClient.mapSessions([mesh])
         #expect(sessions.first?.id == "mesh-local-alpha")

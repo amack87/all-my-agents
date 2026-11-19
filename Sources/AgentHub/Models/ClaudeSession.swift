@@ -23,6 +23,7 @@ struct ClaudeSession: Identifiable, Sendable, Equatable {
     let lastActivity: Date?    // tmux session_activity — last input/output timestamp
     let machine: String?       // nil = local-only discovery, "MBP M4" etc. from mesh
     let machineHost: String?   // nil or "local" = this machine, "100.x.x.x:3456" = remote peer
+    let task: String?          // what the agent says it is doing right now
 
     /// Whether this session lives on a remote machine (needs WebSocket proxy).
     var isRemote: Bool {

@@ -21,6 +21,7 @@ import { buildRestorePlan } from "./restore-plan.js";
 import { indexClaudeSessions, isClaudeSessionId } from "./claude-session-index.js";
 import { detectStatusFromScreen } from "./agent-status.js";
 import { EVENT_TYPES, applyEvent, eventStatus, resolveIdentity } from "./agent-events.js";
+import { applyTaskUpdate } from "./task.js";
 import { createMessageStore } from "./agent-messages.js";
 import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
 import { validateSendBody, sendPromptCalls } from "./send-prompt.js";
@@ -587,6 +588,28 @@ function setEventState(name, paneId, state) {
   eventStates.set(paneId, state);
 }
 
+// --- Task state -------------------------------------------------------------
+// What an agent says it is doing right now. Agents report it alongside the
+// lifecycle events; the server stores it per session — keyed by tmux session
+// name with a pane-id alias, like the event state — and carries it into the
+// session list and the status feed. The store is in-memory: the task is
+// live state, not history, and a restart clears it.
+const taskStates = new Map(); // session name or pane id → task (string) or null
+
+function getTaskState(key) {
+  return taskStates.get(key) ?? null;
+}
+
+function setTaskState(name, paneId, task) {
+  taskStates.set(name, task);
+  taskStates.set(paneId, task);
+}
+
+// The task a session currently has: by name, else by pane id, else none.
+function currentTask(name, paneId) {
+  return getTaskState(name) ?? getTaskState(paneId);
+}
+
 // Effective status for a session: fresh event state wins, else screen.
 function effectiveStatus(paneKey, sessionName, content) {
   const state = getEventState(paneKey)
@@ -1025,12 +1048,13 @@ const paneResolution = {
 // unknown event names are accepted as no-ops. A fresh event-derived status
 // then overrides screen detection until it goes stale.
 app.post("/api/events", async (req, res) => {
-  const { event, sessionId, surfaceToken, message } = req.body || {};
+  const { event, sessionId, surfaceToken, message, task } = req.body || {};
   const malformed =
     typeof event !== "string" || !event ||
     (sessionId !== undefined && (typeof sessionId !== "string" || !sessionId)) ||
     (surfaceToken !== undefined && (typeof surfaceToken !== "string" || !surfaceToken)) ||
-    (message !== undefined && typeof message !== "string");
+    (message !== undefined && typeof message !== "string") ||
+    (task !== undefined && task !== null && typeof task !== "string");
   if (malformed) {
     return res.status(400).json({ error: "Malformed event payload" });
   }
@@ -1069,6 +1093,15 @@ app.post("/api/events", async (req, res) => {
   const next = applyEvent(prev, event, Date.now());
   if (next) setEventState(name, paneId, next);
 
+  // A task update rides along with the event. An event that carries no task
+  // keeps the one the session already has — an agent reporting its status
+  // must not erase the task it reported a minute ago. An explicit null
+  // clears it. The task is trimmed and capped on the way in (task.js).
+  const taskUpdate = applyTaskUpdate(task, currentTask(name, paneId));
+  if (taskUpdate.effect !== "keep") {
+    setTaskState(name, paneId, taskUpdate.task);
+  }
+
   const known = EVENT_TYPES.includes(event);
   const status = eventStatus(next, Date.now(), EVENT_TTL_MS);
   if (status) {
@@ -1085,6 +1118,7 @@ app.post("/api/events", async (req, res) => {
     source: status ? "event" : null,
     changed: (prev?.status ?? null) !== (next?.status ?? null),
     messageId,
+    task: currentTask(name, paneId),
   });
 });
 
@@ -1579,6 +1613,7 @@ async function discoverSessions() {
       source: statusSource,
       agent,
       lastActivity: parseInt(e.sessionActivity, 10) || 0,
+      task: currentTask(e.sessionName, e.paneId),
     };
   }));
 

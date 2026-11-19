@@ -164,7 +164,8 @@ final class SessionMonitor {
                     lastSeen: Date(),
                     lastActivity: tmuxInfo?.activity,
                     machine: nil,
-                    machineHost: nil
+                    machineHost: nil,
+                    task: nil
                 )
             }
 
@@ -191,7 +192,8 @@ final class SessionMonitor {
                     lastSeen: Date(),
                     lastActivity: paneInfo.activity,
                     machine: nil,
-                    machineHost: nil
+                    machineHost: nil,
+                    task: nil
                 ))
             }
 
