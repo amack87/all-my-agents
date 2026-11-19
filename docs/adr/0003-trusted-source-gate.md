@@ -33,7 +33,7 @@ Trusted sources:
 
 The bridge range is trusted only when the connection actually *landed on the bridge*: the connection's local address must equal this machine's own address on that bridge. A Wi-Fi LAN that happens to reuse `192.168.64.0/24` would otherwise inherit the VM's trust wholesale. Loopback and Tailscale connections are trusted wherever they land.
 
-The bridge address is discovered at startup from the network interfaces whose name matches `/^(bridge|vmnet|vnet)/i`. If no such interface exists, the bridge range is not trusted at all — the server fails closed, and the log says so.
+The bridge address is discovered from the machine's current network interfaces, whose name matches `/^(bridge|vmnet|vnet)/i`. If no such interface exists, the bridge range is not trusted at all — the server fails closed, and the log says so. The interfaces are read when the decision is made, never snapshotted at boot: the bridge appears when the VM is booted, which is long after the server started, and a snapshot taken at boot would leave the VM's own traffic refused for the life of the process.
 
 The gate sits at the TCP level rather than in route handlers because a rejected route still completes the handshake and still consumes a socket; the point is to not have the connection at all.
 
@@ -44,4 +44,5 @@ The gate sits at the TCP level rather than in route handlers because a rejected 
 - Trust is a property of the *address*, not of the network. A machine whose address falls in one of the trusted ranges is trusted — the ranges are the boundary.
 - The server no longer depends on the surrounding network being the right one. Tailscale's network-level isolation becomes defence in depth rather than the only defence.
 - If the machine has no virtualization bridge, that source is simply absent. The failure mode is "the VM cannot reach the server", never "the server is exposed".
+- The bridge is trusted as soon as the interface exists. Booting the VM is enough to make its traffic trusted; nothing has to be restarted, and the log records the sources it trusts at startup.
 - `network-access.js` holds the rules and is free of side effects, so they are unit-testable; `test/network-access.test.js` covers the range membership and the local-address pin.

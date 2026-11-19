@@ -15,6 +15,7 @@ import {
   buildLocalAuthorities,
   buildPeerAuthorities,
   isAllowedOrigin as isOriginAllowed,
+  parseOrigin,
 } from "./origin-allowlist.js";
 import { buildRestorePlan } from "./restore-plan.js";
 import { indexClaudeSessions, isClaudeSessionId } from "./claude-session-index.js";
@@ -89,11 +90,20 @@ const PORT = parseInt(process.env.ALL_MY_AGENTS_PORT || "3456", 10);
 // The port is part of the match — "http://localhost" is a different server
 // from "http://localhost:3456", and a malicious local web server must not be
 // able to drive the API on this one.
-const LOCAL_AUTHORITIES = buildLocalAuthorities({
-  hostname: os.hostname(),
-  addresses: Object.values(os.networkInterfaces()).flat(),
-  port: PORT,
-});
+//
+// The addresses are read when they are needed, never snapshotted at boot.
+// The machine's addresses change while the server runs — Tailscale connects,
+// renumbers or reconnects, the Wi-Fi lease changes — and a snapshot taken
+// at boot goes stale. A stale allowlist refuses this machine's OWN origin
+// with a 403, which the user never sees as a refusal: the page loads, the
+// script never arrives, and the app hangs on "loading sessions".
+export function localAuthorities() {
+  return buildLocalAuthorities({
+    hostname: os.hostname(),
+    addresses: Object.values(os.networkInterfaces()).flat(),
+    port: PORT,
+  });
+}
 
 // This machine's own MagicDNS name, in full — machine AND tailnet. Only the
 // whole name identifies it: the tailnet segment is chosen by whoever owns the
@@ -124,11 +134,39 @@ async function knownPeerAuthorities() {
   return authorities;
 }
 
-async function isAllowedOrigin(origin) {
+// Is this Origin allowed to drive the API?
+//
+// The three sources of trust are tried in order of cost, and each one that
+// matches ends the question.
+//
+// 1. This machine's own addresses — answered from the interfaces alone, no
+//    I/O at all.
+// 2. This machine's own MagicDNS name — one `tailscale status`.
+// 3. A mesh peer — the full peer discovery, which probes every online peer
+//    on the tailnet and can take seconds.
+//
+// The order matters for the phone. It browses this server by its tailnet
+// address, and Safari sends an Origin on every request, so a request that
+// waits for peer discovery stalls the page load — the app "hangs on loading
+// sessions" for as long as the probe takes. A local origin must never pay
+// for the peer check.
+//
+// The verdict is the same either way: a request is allowed when ANY of the
+// three matches.
+export async function isAllowedOrigin(origin, {
+  local = localAuthorities(),
+  magicDnsNames = localMagicDnsNames,
+  peerAuthorities = knownPeerAuthorities,
+} = {}) {
+  if (!parseOrigin(origin)) return false;
+  if (isOriginAllowed(origin, { localAuthorities: local })) return true;
+  const magic = await magicDnsNames();
+  if (isOriginAllowed(origin, { localAuthorities: local, magicDnsNames: magic, magicDnsPort: PORT })) return true;
+  const peers = await peerAuthorities();
   return isOriginAllowed(origin, {
-    localAuthorities: LOCAL_AUTHORITIES,
-    peerAuthorities: await knownPeerAuthorities(),
-    magicDnsNames: await localMagicDnsNames(),
+    localAuthorities: local,
+    peerAuthorities: peers,
+    magicDnsNames: magic,
     magicDnsPort: PORT,
   });
 }
@@ -1962,7 +2000,17 @@ function findBridgeAddress() {
   return null;
 }
 
-const BRIDGE_ADDRESS = findBridgeAddress();
+// Is this connection allowed? The bridge address is read now, never from a
+// snapshot taken at boot: the bridge appears when the VM is booted, which is
+// usually long after the server started. A stale snapshot refuses the VM's
+// own traffic for as long as the server is left running.
+export function isTrustedSocket({ remoteAddress, localAddress } = {}) {
+  return isTrustedConnection({
+    remoteAddress,
+    localAddress,
+    bridgeAddress: findBridgeAddress(),
+  });
+}
 
 export { app, agentMessages, surfaceTokens, paneResolution };
 if (process.env.NODE_ENV !== "test") {
@@ -1973,17 +2021,17 @@ if (process.env.NODE_ENV !== "test") {
     log: (level, msg, extra) => log(level, msg, extra),
   });
   const server = app.listen(PORT, "0.0.0.0", () => {
+    const bridge = findBridgeAddress();
     log("INFO", `Server started on http://0.0.0.0:${PORT} (loopback, Tailscale and VM network only)`);
     log("INFO", `Log file: ${join(LOG_DIR, "server.log")}`);
-    log("INFO", `Trusted sources: loopback, Tailscale${BRIDGE_ADDRESS ? `, VM bridge ${BRIDGE_ADDRESS}` : " (no VM bridge found)"}`);
+    log("INFO", `Trusted sources: loopback, Tailscale${bridge ? `, VM bridge ${bridge}` : " (no VM bridge found)"}`);
     startMaintenance();
   });
   // Refuse Wi-Fi LAN (and any other untrusted) connections before HTTP or WebSocket handling.
   server.on("connection", (socket) => {
-    if (isTrustedConnection({
+    if (isTrustedSocket({
       remoteAddress: socket.remoteAddress,
       localAddress: socket.localAddress,
-      bridgeAddress: BRIDGE_ADDRESS,
     })) return;
     log("WARN", "Refused connection from untrusted address", {
       remoteAddress: socket.remoteAddress,
