@@ -43,6 +43,9 @@ Task state is stored **in the macOS app**, fed from the server's event stream. T
 - **One task per session** — the task belongs to the session (the tmux pane), not to an agent
   inside it. Two agents in the same pane report against the same slot and the last report
   wins.
+- **Provenance** — a task only reaches the server from the holder of that session's surface
+  token (ADR-0016), so the text the app renders for a session was written by that session's
+  own agent, not by a caller that merely knew its session id.
 
 The app never persists the task. It is re-read from the server on the next snapshot, so a task
 survives an **app** restart for as long as the **server** is still running (the server holds

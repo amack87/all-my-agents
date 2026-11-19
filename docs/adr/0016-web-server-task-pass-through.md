@@ -89,6 +89,27 @@ markup (`<script>`, an attribute-breaking quote, an ampersand) asserted **verbat
 layer may quietly "clean" a task. Both suites read it: `web/test/task-contract.test.js`
 (canonicalisation) and `Tests/AllMyAgentsTests/TaskContractTests.swift` (the wire form).
 
+### 7. Only the surface token may write a task
+
+A task is the agent's own voice — it says what that agent is doing, and it lands in the
+sidebar the user supervises. The session's **surface token** is the only credential that
+authorises it: a task posted without a token, or with another session's token, is a
+**403 Task requires a surface token**.
+
+A **registry session id** is not a credential. It is readable from the unauthenticated
+`GET /api/registry`, so anything that can reach the server can read it. It still authorises
+*status* events on the pre-existing channel, and it must not authorise a task: a spoofed task
+is a lie in the user's face, in the one place the user looks to see what their agents are up
+to.
+
+Status events keep the looser rule. Tightening that channel is a decision about
+`/api/events` as a whole, not this ADR's business.
+
+Neither agent integration reports a task yet — `web/integrations/claude/ama-status-hook.js`
+and `web/integrations/opencode/ama-status.js` post status events — but both already send the
+surface token when they have one, so extending them to report a task brings the credential the
+channel requires. An agent that has no token may still report status; its tasks are refused.
+
 ## Alternatives considered
 
 #### A. Server infers task state from screen content
@@ -111,6 +132,14 @@ caller sizes. It is also an amplification: one POST is relayed into every `/ws/s
 subscriber and every `/api/mesh/sessions` reader, so an unbounded string is cheap to send
 and expensive to fan out. The 100 kb body cap is far larger than a task line — it bounds the
 request, not the field.
+
+#### E. Require the surface token for the whole event channel
+
+**Rejected for now**: a task is the agent's own voice and belongs in the sidebar the user
+supervises, so it gets the token. A status is a coarser signal the sidebar already tolerates
+from any source that can reach the server. Tightening the whole channel is a bigger change
+with its own blast radius — it would touch every existing agent integration — and it is not
+what this ADR is about.
 
 #### D. Server persists task state for restart recovery
 
@@ -136,11 +165,10 @@ step if task history is wanted, and it belongs with the app, not the server.
 
 ### Known limits
 
-The task channel inherits `/api/events`'s existing identity rules: a **surface token**, or a
-**registry session id**. A session id is not a secret — it is readable from the unauthenticated
-`GET /api/registry` — so a task can be written to another session's slot by anything that can
-reach the server. This is the same exposure the event channel has always had; it is worth
-deciding whether the task channel should tighten it, separately from this ADR.
+- The **status** channel still accepts a registry session id as an alternative to a surface
+  token. That is pre-existing and unchanged here, so anything that can reach the server can
+  report a status for a session it does not own. Tightening it belongs to a decision about
+  `/api/events` as a whole.
 
 ## Implementation Checklist
 
@@ -154,6 +182,8 @@ deciding whether the task channel should tighten it, separately from this ADR.
 - [x] The snapshot signature includes the task, so a task-only change is pushed
       (`web/status-feed.js`)
 - [x] The renderer escapes the task (`web/public/session-task.js`)
+- [x] A task may only be written by the holder of the session's surface token
+      (`web/server.js`)
 - [x] The contract declares `task` (`contract/api-contract.json`, version 6)
 - [x] The shared fixture carries hostile inputs and is read by both suites
       (`contract/task-update.json`)

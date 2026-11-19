@@ -11,7 +11,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -110,6 +111,21 @@ test("a session with no task renders no task", () => {
 // safe and does not listen. The pane lookup it uses is a seam the suite
 // points at a stub, so these tests run without a live tmux pane.
 
+// The registry a session id is resolved against is read from disk at boot,
+// so the test points the log directory at a temporary one and writes a
+// registry there before the server is imported.
+const logDir = mkdtempSync(join(tmpdir(), "ama-task-"));
+process.env.ALL_MY_AGENTS_LOG_DIR = logDir;
+process.env.ALL_MY_AGENTS_REGISTRY_POLL_MS = "3600000";
+writeFileSync(
+  join(logDir, "active-sessions.json"),
+  JSON.stringify({
+    version: 2,
+    updatedAt: Date.now(),
+    sessions: [{ sessionId: "ses_task_registry", tmux: "registry-slice" }],
+  }),
+);
+
 process.env.NODE_ENV = "test";
 const { app, surfaceTokens, paneResolution } = await import("../server.js");
 
@@ -136,6 +152,15 @@ async function postEvent(body) {
     return await call("POST", "/api/events", { event: "stop", surfaceToken: "tok-task", ...body });
   } finally {
     surfaceTokens.delete("tok-task");
+    paneResolution.paneFor = realPaneFor;
+  }
+}
+
+async function postEventRaw(body) {
+  paneResolution.paneFor = livePane;
+  try {
+    return await call("POST", "/api/events", body);
+  } finally {
     paneResolution.paneFor = realPaneFor;
   }
 }
@@ -170,4 +195,36 @@ test("an explicit null clears the task", async () => {
   const { statusCode, payload } = await postEvent({ task: null });
   assert.equal(statusCode, 200);
   assert.equal(payload.task, null);
+});
+
+// A registry session id is not a secret — it is readable from the
+// unauthenticated GET /api/registry — so it must not authorise a task.
+test("a task reported with only a registry session id is refused", async () => {
+  const { statusCode, payload } = await postEventRaw({
+    event: "stop",
+    sessionId: "ses_task_registry",
+    task: "Spoofed task",
+  });
+  assert.equal(statusCode, 403);
+  assert.ok("error" in payload);
+});
+
+test("a task reported with a token that is not this session's is refused", async () => {
+  const { statusCode, payload } = await postEventRaw({
+    event: "stop",
+    sessionId: "ses_task_registry",
+    surfaceToken: "tok-not-this-session",
+    task: "Spoofed task",
+  });
+  assert.equal(statusCode, 403);
+  assert.ok("error" in payload);
+});
+
+test("a status event with only a registry session id is still accepted", async () => {
+  const { statusCode, payload } = await postEventRaw({
+    event: "stop",
+    sessionId: "ses_task_registry",
+  });
+  assert.equal(statusCode, 200);
+  assert.equal(payload.ok, true);
 });

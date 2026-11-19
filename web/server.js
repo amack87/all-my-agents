@@ -1070,6 +1070,14 @@ app.post("/api/events", async (req, res) => {
     return res.status(422).json({ error: "Unmatched", reason: identity.reason });
   }
   const name = identity.name;
+  // The task channel is the agent's own voice: only the holder of this
+  // session's surface token may write it. A registry session id is not a
+  // secret — anyone who can reach the server can read it from the
+  // unauthenticated GET /api/registry — so it must not authorise a task.
+  // Status events keep the looser rule; a task does not.
+  if (task !== undefined && surfaceTokens.get(surfaceToken) !== name) {
+    return res.status(403).json({ error: "Task requires a surface token" });
+  }
   if (!TMUX_TARGET_RE.test(name)) {
     return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
   }
