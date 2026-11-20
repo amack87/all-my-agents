@@ -27,6 +27,74 @@ test("a filed message carries the origin it was filed with, or none", () => {
   assert.equal(withoutOrigin.origin, null);
 });
 
+// An agent's hook can deliver the same message twice: Claude Code fires its
+// Stop hook once after the assistant's text and once after a tool-use turn,
+// each carrying the same last_assistant_message. The store recognises that
+// repeat where the message is filed, so the panel and the transcript see one
+// message. The window is short and the comparison is exact — same text, same
+// origin, within the window of the session's previous message. A repeat
+// outside the window is the agent saying it again, and is filed. The clock is
+// injected so the tests can walk up to and past the window without sleeping.
+
+test("the same agent message filed twice in quick succession is stored once", () => {
+  let now = 1_000;
+  const store = createMessageStore({ now: () => now });
+  const first = store.file("slice", "working on it", "agent");
+  now = 1_000 + 5_000; // inside the window
+  const second = store.file("slice", "working on it", "agent");
+  assert.equal(second, first, "the repeat answers the id of the first filing");
+  const [only] = store.messages("slice");
+  assert.equal(store.messages("slice").length, 1, "one message where the hook delivered two");
+  assert.equal(only.id, first, "the stored message keeps its id from the first filing");
+  assert.equal(only.at, 1_000, "the stored message keeps its timestamp from the first filing");
+});
+
+test("the same agent message filed again outside the window is stored again", () => {
+  let now = 1_000;
+  const store = createMessageStore({ now: () => now });
+  const first = store.file("slice", "working on it", "agent");
+  now = 1_000 + 60_000; // past the window
+  const second = store.file("slice", "working on it", "agent");
+  assert.ok(second > first, "the repeat outside the window is a new message");
+  assert.deepEqual(store.messages("slice").map((m) => m.text), [
+    "working on it",
+    "working on it",
+  ]);
+});
+
+test("a panel reply is always stored, never treated as a repeat", () => {
+  let now = 1_000;
+  const store = createMessageStore({ now: () => now });
+  const first = store.file("slice", "yes, approved", "panel");
+  now = 1_000 + 5_000; // inside the window
+  const second = store.file("slice", "yes, approved", "panel");
+  assert.ok(second > first, "the same panel text twice is two messages");
+  assert.equal(store.messages("slice").length, 2);
+});
+
+test("a panel reply is not treated as a repeat of the agent's message", () => {
+  let now = 1_000;
+  const store = createMessageStore({ now: () => now });
+  store.file("slice", "working on it", "agent");
+  now = 1_000 + 5_000; // inside the window
+  store.file("slice", "working on it", "panel");
+  assert.equal(store.messages("slice").length, 2, "both are stored");
+});
+
+test("only the previous message is the repeat candidate", () => {
+  // The rule is scoped to the session's previous message: an agent message
+  // after a panel reply files, even though the agent said the same text
+  // moments ago. A consumer ordering the transcript still reads every turn.
+  let now = 1_000;
+  const store = createMessageStore({ now: () => now });
+  store.file("slice", "working on it", "agent");
+  now = 1_000 + 5_000;
+  store.file("slice", "working on it", "panel");
+  now = 1_000 + 6_000;
+  store.file("slice", "working on it", "agent");
+  assert.equal(store.messages("slice").length, 3);
+});
+
 test("messages come back oldest first", () => {
   const store = createMessageStore();
   const ids = [store.file("slice", "one"), store.file("slice", "two"), store.file("slice", "three")];
@@ -205,6 +273,34 @@ test("an event that carries a message files it against the resolved session", as
     assert.equal(typeof payload.messageId, "number");
     assert.ok(payload.messageId > (before ?? 0), "the ack carries the id of the filed message");
     const stored = agentMessages.messages("event-slice", before ?? 0);
+    assert.deepEqual(stored.map((m) => m.text), ["the reply"]);
+  } finally {
+    surfaceTokens.delete("tok-agent-message");
+    agentMessages.clear("event-slice");
+    paneResolution.paneFor = realPaneFor;
+  }
+});
+
+test("an event whose hook fired twice files the message once", async () => {
+  surfaceTokens.set("tok-agent-message", "event-slice");
+  paneResolution.paneFor = livePane;
+  try {
+    const first = await call("POST", "/api/events", {
+      event: "stop",
+      surfaceToken: "tok-agent-message",
+      message: "the reply",
+    });
+    const second = await call("POST", "/api/events", {
+      event: "stop",
+      surfaceToken: "tok-agent-message",
+      message: "the reply",
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.payload.messageId, first.payload.messageId,
+      "the second firing acks the id of the message the first one filed");
+    const stored = agentMessages.messages("event-slice");
+    assert.equal(stored.length, 1, "one message where the hook delivered two");
     assert.deepEqual(stored.map((m) => m.text), ["the reply"]);
   } finally {
     surfaceTokens.delete("tok-agent-message");
