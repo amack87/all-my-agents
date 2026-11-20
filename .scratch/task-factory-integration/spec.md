@@ -1,6 +1,6 @@
 # PRD: All My Agents knows about task groups, working directories and agent messages
 
-Status: ready-for-agent
+Status: done — implemented
 Tracker: this repository, `.scratch/task-factory-integration/`
 
 Task Factory gives each captured task its own agent, and that agent is an All My Agents session.

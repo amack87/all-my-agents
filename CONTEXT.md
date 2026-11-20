@@ -14,10 +14,12 @@ Ubiquitous language for All My Agents. Definitions only — no implementation de
 - **Peer** — another AMA instance reachable over the mesh, contributing its sessions to the same sidebar.
 - **Pane** — the tmux pane a session is made of. A pane is always a shell; anything a session runs is typed into that shell, so the pane outlives whatever it was running.
 - **Surface token** — a per-session secret that binds a pane to its AMA session. An agent adapter inside the pane reads it from the environment and presents it when reporting status, so the server can tell which session an event came from without matching on screen text.
+- **Owner token** — a per-session secret handed to whoever created the session. It lets that caller write the session's state and nothing else; it is never published in a session shape, and after a restart the state it guards is read-only until the session is claimed again.
 - **Launch command** — the command a session's pane runs instead of a default shell. It lets a session reach a machine other than the one hosting it.
 - **Target** — a named remote machine a launch command reaches. A session aimed at a target is hosted by the local machine, but the agent inside it runs on the target.
 - **Contract** — the machine-readable description of AMA's API: the status vocabulary, the routes a client may call, and the shape of what those routes return. A client fetches the contract rather than assuming it, so a change in AMA cannot drift past a client unnoticed.
 - **Agent message** — the text an agent produced, reported by the agent itself rather than read off its screen, and filed against the session its surface token identifies.
+- **Message origin** — where a message came from: the agent that produced it, or the user through the chat panel. A message typed into a terminal has no origin, and is not trusted to carry a decision.
 - **Voice bridge** — a separate application that owns the microphone, the speech in and the spoken reply, and drives AMA's sessions through AMA's API. AMA itself has no voice interface.
 - **Terminal palette** — the fixed dark colours every AMA terminal paints with, whatever the host's appearance is. An agent reads the terminal's background and themes itself to match, so the palette is a shared fact between AMA and the agent in the pane, not a local style choice.
 
