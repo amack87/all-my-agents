@@ -99,11 +99,11 @@ The separate All My Agents-Mobile project (also Node) is unrelated to `web/` —
 
 ### Issue tracker
 
-Issues and PRDs live as GitHub issues (`gh` CLI) in `amack87/all-my-agents`, PRDs as `PRD: <feature>` and tickets as `<n> — <title>`. See `docs/agents/issue-tracker.md`.
+Issues and PRDs live as markdown files in `.scratch/` — there is no issue tracker service. PRDs are `PRD: <feature>`, tickets are numbered per PRD under the feature's `issues/` folder. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-The five canonical roles map 1:1 to `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+The five canonical roles map 1:1 to `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`, recorded on a `Status:` line in each issue file. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 

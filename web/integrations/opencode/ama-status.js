@@ -105,13 +105,38 @@ function assistantText(info) {
 // carries. Taken once, then forgotten — a reply belongs to one turn.
 function createReplyTracker() {
   const replies = new Map();
+  const assistants = new Map();
   return {
     observe(busEvent) {
       const properties = busEvent?.properties;
-      if (properties?.info?.role !== "assistant") return;
-      const text = assistantText(properties.info);
+      const type = busEvent?.type;
       const sessionId = sessionIdFromBusProps(busEvent);
-      if (sessionId && text) replies.set(sessionId, text);
+      if (!sessionId) return;
+      if (type === "message.updated") {
+        if (properties?.info?.role !== "assistant") return;
+        // The id of the message the agent is speaking in: the parts that
+        // follow belong to it.
+        const id = properties.info?.id;
+        if (id) {
+          const ids = assistants.get(sessionId) ?? new Set();
+          ids.add(id);
+          assistants.set(sessionId, ids);
+        }
+        // Older opencode carries the text inside the message itself.
+        const text = assistantText(properties.info);
+        if (text) replies.set(sessionId, text);
+        return;
+      }
+      if (type === "message.part.updated") {
+        // opencode 1.19 and later: the text arrives as a part of the
+        // message, not inside it, so the reply is read from the part — and
+        // only from the agent's own message, never the person's.
+        const part = properties?.part;
+        if (part?.type !== "text" || typeof part.text !== "string") return;
+        const ids = assistants.get(sessionId);
+        if (!ids || !part.messageID || !ids.has(part.messageID)) return;
+        replies.set(sessionId, part.text);
+      }
     },
     take(sessionId) {
       const text = replies.get(sessionId);
@@ -120,6 +145,7 @@ function createReplyTracker() {
     },
     forget(sessionId) {
       replies.delete(sessionId);
+      assistants.delete(sessionId);
     },
   };
 }
@@ -191,8 +217,10 @@ export const AmaStatusPlugin = async () => {
       // The assistant's reply is observed from the message bus itself: opencode
       // reports the completed message just before the session goes idle, so
       // the stop event this adapter already sends carries it — the same shape
-      // Claude Code's Stop hook produces.
-      if (event?.type === "message.updated") {
+      // Claude Code's Stop hook produces. The text arrives with the message
+      // on older opencode and as a part of it on 1.19 and later, so both
+      // are watched.
+      if (event?.type === "message.updated" || event?.type === "message.part.updated") {
         replies.observe(event);
         return;
       }

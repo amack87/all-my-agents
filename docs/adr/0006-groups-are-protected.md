@@ -5,7 +5,7 @@ Scope: system
 
 ## Status
 
-Accepted
+Accepted. **Amended by [ADR 0017](0017-sessions-declare-group-state-and-working-directory.md)**: group *membership* is now server-declared (a session carries the group it belongs to), and the synced store keeps only order, collapsed state and ungrouped order. The `groupsCleared` flag described below is dropped; `pickWinner` still protects the group list and order. The Decision section below is the original record and is kept unchanged.
 
 ## Context
 
