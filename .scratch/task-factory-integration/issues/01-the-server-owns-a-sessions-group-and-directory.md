@@ -1,7 +1,7 @@
 # 1 — The server owns a session's group and directory
 
 Part of: .scratch/task-factory-integration/spec.md
-Status: ready-for-agent
+Status: done — branch `issue/01-server-owns-group-and-directory`
 Labels: feature
 
 ## What to build
@@ -33,3 +33,15 @@ the new fields written into the shared fixture and asserted by both suites.
 ## Blocked by
 
 None - can start immediately
+
+## Done
+
+Implemented on `issue/01-server-owns-group-and-directory` (3 commits). `POST /api/sessions`
+accepts optional `dir` and `group`; membership is server-declared and carried by the registry
+across a restart; the sessions list, the mesh snapshot and the `/ws/status` frame publish
+`group` and `dir`; `POST /api/events` refuses `group`/`dir`/`state`. The contract is at
+version 7 with the new fields in `contract/api-contract.json` and one case in
+`contract/session-fields.json`, asserted by both suites. ADR 0006 is amended as ADR 0017
+describes: the synced sidebar store drops `groupsCleared`. Sidebar rendering and drag
+behaviour are unchanged (ticket 2). Known transient gap until ticket 2: because the erasure
+flag is gone, deleting a surface's last group no longer propagates through the sync.
