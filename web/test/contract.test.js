@@ -18,6 +18,7 @@ import {
   isSafeGroupName,
 } from "../public/sidebar-sync.js";
 import { checkShape } from "../api-contract.js";
+import { resolveOrder } from "../public/session-order.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractPath = join(here, "..", "..", "contract", "sidebar-groups.json");
@@ -27,6 +28,12 @@ const apiContract = JSON.parse(
 );
 const sessionFieldsPath = join(here, "..", "..", "contract", "session-fields.json");
 const sessionFields = JSON.parse(readFileSync(sessionFieldsPath, "utf8"));
+
+// The membership merge: which tiles are in which group, in which order, when
+// the sessions' server-declared groups meet the user's manual order. Both
+// suites run their own ordering model over the same cases.
+const membershipPath = join(here, "..", "..", "contract", "sidebar-membership.json");
+const membership = JSON.parse(readFileSync(membershipPath, "utf8"));
 
 const shapeCtx = { shapes: apiContract.shapes, vocabulary: apiContract.statuses.vocabulary };
 
@@ -76,5 +83,22 @@ test("the shared session-fields contract resolves identically on the macOS app",
   for (const c of sessionFields.cases) {
     assert.equal(c.session.group, c.expected.group, `contract case "${c.name}": group`);
     assert.equal(c.session.dir, c.expected.dir, `contract case "${c.name}": dir`);
+  }
+});
+
+test("the shared membership contract resolves identically on the macOS app", () => {
+  assert.ok(Array.isArray(membership.cases));
+  assert.ok(membership.cases.length > 0);
+  for (const c of membership.cases) {
+    const out = resolveOrder(c.data, c.sessions);
+    const observed = {
+      groups: out.groups.map((g) => ({
+        name: g.name,
+        serverDeclared: g.serverDeclared,
+        members: g.sessions.map((s) => s.name),
+      })),
+      ungrouped: out.ungrouped.map((s) => s.name),
+    };
+    assert.deepEqual(observed, c.expected, `contract case "${c.name}"`);
   }
 });
