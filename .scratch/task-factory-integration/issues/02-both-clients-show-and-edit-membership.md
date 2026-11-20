@@ -1,7 +1,7 @@
 # 2 — Both clients show and edit membership
 
 Part of: .scratch/task-factory-integration/spec.md
-Status: ready-for-agent
+Status: done — branch `issue/02-both-clients-show-and-edit-membership`
 Labels: feature
 
 ## What to build
