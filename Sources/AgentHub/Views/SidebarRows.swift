@@ -67,6 +67,19 @@ struct GroupHeaderRow: View {
             Text(group.name)
                 .font(.caption2.bold())
                 .lineLimit(1)
+            if group.isServerDeclared {
+                // The group exists because the server declared its members
+                // (ADR 0017), not because James arranged it — so he knows he
+                // does not own this tile-home until he acts on the group.
+                Text("SERVER")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 3)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 3)
+                            .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1)
+                    )
+            }
             Spacer()
             Text("\(group.sessions.count)")
                 .font(.caption2)

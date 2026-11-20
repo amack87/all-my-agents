@@ -85,6 +85,38 @@ enum MeshAPIClient {
         }
     }
 
+    // MARK: - Session membership (ADR 0017)
+
+    /// The body of a membership declaration.
+    struct SetSessionGroupBody: Encodable {
+        let group: String?
+    }
+
+    /// Declare which group a session belongs to (POST /api/sessions/{name}/group).
+    /// Membership is the server's to declare (ADR 0017): moving a tile into or
+    /// out of a group is this write, not an edit of the local store. `group`
+    /// nil takes the session out of any group. True when the server accepted.
+    static func setSessionGroup(
+        _ group: String?,
+        name: String,
+        serverURL: String = "http://localhost:3456"
+    ) async -> Bool {
+        let encoded = name.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? name
+        guard let url = URL(string: serverURL + "/api/sessions/\(encoded)/group") else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = timeoutSeconds
+        request.httpBody = try? JSONEncoder().encode(SetSessionGroupBody(group: group))
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200..<300).contains(http.statusCode)
+        } catch {
+            return false
+        }
+    }
+
     // MARK: - Sidebar groups (local-first sync)
 
     /// Mirrors the web server's `/api/sidebar-groups` envelope. `data` is nil

@@ -83,16 +83,33 @@ final class NotificationStore {
     }
 
     func groupName(for session: ClaudeSession) -> String? {
-        let key = session.sidebarKey
-        return sidebarOrder.order.first { name in
-            (sidebarOrder.groups[name] ?? []).contains(key)
+        // Membership is server-declared (ADR 0017): the session's group is
+        // what the server says, not what this app's copy of the store
+        // remembers.
+        guard let group = session.group, SidebarOrder.isSafeGroupName(group) else {
+            return nil
         }
+        return group
     }
 
     /// Assign (non-nil) or remove (nil) a session's group membership.
     /// Adding appends to the end of the group, creating it if needed;
     /// removing returns the tile to the bottom of the ungrouped region.
+    /// Declare membership on the server (ADR 0017): joining or leaving a
+    /// group is a server write. If it fails the mesh/feed brings the server's
+    /// truth back on its next update. A peer session's membership belongs to
+    /// its own server, so only local sessions are declared here.
+    private func declareMembership(_ session: ClaudeSession, toGroup group: String?) {
+        guard let name = session.tmuxSession, !session.isRemote else { return }
+        let declared = (group?.isEmpty ?? true) ? nil : group
+        let serverURL = meshServerURL
+        Task {
+            _ = await MeshAPIClient.setSessionGroup(declared, name: name, serverURL: serverURL)
+        }
+    }
+
     func assignSession(_ session: ClaudeSession, toGroup group: String?) {
+        declareMembership(session, toGroup: group)
         if let group, !group.isEmpty {
             moveSession(session.sidebarKey, toGroup: group, relativeTo: nil, after: false)
         } else {
@@ -174,6 +191,12 @@ final class NotificationStore {
         next.groups[name] = []
         for key in members where !next.ungroupedOrder.contains(key) {
             next.ungroupedOrder.append(key)
+        }
+        // Membership is the server's to declare (ADR 0017): every member's
+        // group is cleared through the server, or the tiles snap back on the
+        // next mesh update.
+        for session in sessions where members.contains(session.sidebarKey) {
+            declareMembership(session, toGroup: nil)
         }
         commitOrder(next)
     }

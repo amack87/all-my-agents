@@ -349,6 +349,20 @@ struct SessionRowView: View {
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                if let group = session.group, !group.isEmpty {
+                    // The group the server says the session belongs to
+                    // (ADR 0017), shown on the tile.
+                    Text(group)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 3)
+                                .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1)
+                        )
+                }
                 if let task = session.task, !task.isEmpty {
                     Text(task)
                         .font(.caption2)
