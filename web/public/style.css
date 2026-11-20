@@ -1109,3 +1109,223 @@ body.drag-active .session-group-header {
     color: var(--text-dim);
   }
 }
+
+/* --- Chat panel ------------------------------------------------------------ */
+
+#terminal-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  position: relative;
+}
+
+#terminal-body #terminal-container {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Mobile: the panel takes the terminal's place when it is open. */
+#chat-panel {
+  display: none;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+#terminal-view.chat-open #terminal-container {
+  display: none;
+}
+
+#terminal-view.chat-open #chat-panel {
+  display: flex;
+  flex: 1;
+}
+
+.chat-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-bar);
+  flex-shrink: 0;
+}
+
+.chat-session-name {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chat-msg {
+  max-width: 85%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+
+.chat-msg.from-agent {
+  align-self: flex-start;
+  background: var(--bg-bar);
+}
+
+.chat-msg.from-panel {
+  align-self: flex-end;
+  background: var(--accent-dim);
+  border-color: var(--accent-dim);
+}
+
+.chat-msg-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-bottom: 2px;
+}
+
+.chat-msg.from-panel .chat-msg-head {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.chat-msg-text {
+  color: var(--text);
+}
+
+.chat-note {
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.chat-error {
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #f87171;
+  background: var(--bg-bar);
+  border-top: 1px solid var(--border);
+}
+
+.chat-composer {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px calc(var(--safe-bottom) + 8px);
+  border-top: 1px solid var(--border);
+  background: var(--bg-bar);
+  flex-shrink: 0;
+}
+
+.chat-composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-family: inherit;
+  min-height: 38px;
+  max-height: 120px;
+}
+
+.chat-composer textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.chat-send-btn {
+  align-self: flex-end;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.chat-send-btn:active {
+  background: var(--accent-dim);
+}
+
+/* --- Needs you ------------------------------------------------------------- */
+
+.needs-you {
+  border-bottom: 1px solid var(--border);
+  padding: 8px 8px 4px;
+  flex-shrink: 0;
+}
+
+.needs-you-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  padding: 0 4px 6px;
+}
+
+.needs-you-item {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  text-align: left;
+  background: var(--bg-bar);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.needs-you-item:active {
+  border-color: var(--accent);
+}
+
+.needs-you-name {
+  font-weight: 600;
+}
+
+.needs-you-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* Desktop: the panel sits beside the terminal instead of replacing it. */
+@media (min-width: 1024px) {
+  #terminal-view.chat-open #terminal-container {
+    display: block;
+    flex: 1;
+    min-width: 0;
+  }
+
+  #terminal-view.chat-open #chat-panel {
+    display: flex;
+    flex: 0 0 min(380px, 40%);
+    border-left: 1px solid var(--border);
+  }
+}

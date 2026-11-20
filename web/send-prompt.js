@@ -14,16 +14,31 @@
 import { buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
 
 /**
- * Validate the send body: `{ text: "<the prompt>" }`, where text is a
- * non-empty string. Returns `{ ok: true, text }` or `{ ok: false, error }`.
- * The text is not trimmed or altered — it is sent byte for byte.
+ * Validate the send body: `{ text: "<the prompt>", origin?: "panel" }`, where
+ * text is a non-empty string. Returns `{ ok: true, text, origin }` or
+ * `{ ok: false, error }`. The text is not trimmed or altered — it is sent
+ * byte for byte.
+ *
+ * `origin` is where the message came from, filed with it by the route. The
+ * panel declares "panel"; the only value accepted, because a tag that
+ * accepts any string means nothing. An absent origin is null — text the
+ * server delivered for a caller that did not say where it came from. Text
+ * typed into a terminal never goes through this route, so it is never
+ * tagged at all.
  */
 export function validateSendBody(body) {
   const text = body?.text;
   if (typeof text !== "string" || text.length === 0) {
     return { ok: false, error: "Body must be { text: <non-empty string> }" };
   }
-  return { ok: true, text };
+  const origin = body?.origin;
+  if (origin !== undefined) {
+    if (origin !== "panel") {
+      return { ok: false, error: "origin must be \"panel\" when present" };
+    }
+    return { ok: true, text, origin };
+  }
+  return { ok: true, text, origin: null };
 }
 
 /**

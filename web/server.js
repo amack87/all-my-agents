@@ -1043,8 +1043,12 @@ app.post("/api/sessions/:name/rename", async (req, res) => {
 });
 
 // Deliver a prompt to a session: type the text into the session's pane as the
-// agent's own input, then press Enter. An unknown session (no live pane
-// resolves for the name) is 404; a body without a non-empty text is 400.
+// agent's own input, then press Enter, and file the text with the origin the
+// caller declared — a panel reply is recorded as from the panel, a prompt
+// without a declared origin is recorded with none. An unknown session (no
+// live pane resolves for the name) is 404; a body without a non-empty text
+// is 400; a text that cannot claim the panel origin is refused (the tag must
+// mean something). Nothing is filed unless the text was delivered.
 app.post("/api/sessions/:name/send", async (req, res) => {
   const body = validateSendBody(req.body);
   if (!body.ok) {
@@ -1052,23 +1056,17 @@ app.post("/api/sessions/:name/send", async (req, res) => {
   }
   if (!validateTarget(res, req.params.name)) return;
   const name = req.params.name;
-  let paneId = null;
-  try {
-    const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
-    paneId = out.split("\n")[0]?.trim() || null;
-  } catch { /* no such session — reported as unknown below */ }
+  const paneId = await paneResolution.paneFor(name);
   if (!paneId) {
     return res.status(404).json({ error: `Unknown session: ${name}` });
   }
-  const timeoutMs = 5000;
   try {
-    for (const args of sendPromptCalls(paneId, body.text)) {
-      await execFileAsync(TMUX, args, { timeout: timeoutMs });
-    }
+    await promptDelivery.deliver(paneId, body.text);
   } catch (err) {
     return res.status(500).json({ error: redactTokens(err.message) });
   }
-  log("INFO", "Prompt sent", { name, paneId });
+  agentMessages.file(name, body.text, body.origin);
+  log("INFO", "Prompt sent", { name, paneId, origin: body.origin });
   res.json({ ok: true, name, paneId });
 });
 
@@ -1109,6 +1107,18 @@ const paneResolution = {
       const out = await tmux("list-panes", "-t", name, "-F", "#{pane_id}");
       return out.split("\n")[0]?.trim() || null;
     } catch { return null; }
+  },
+};
+
+// Deliver a prompt to a live pane: the two send-keys calls, in order. The
+// indirection is a seam like paneFor: the suite points deliver at a stub so
+// the send route's tests run without a live tmux pane.
+const promptDelivery = {
+  async deliver(paneId, text) {
+    const timeoutMs = 5000;
+    for (const args of sendPromptCalls(paneId, text)) {
+      await execFileAsync(TMUX, args, { timeout: timeoutMs });
+    }
   },
 };
 
@@ -1168,10 +1178,11 @@ app.post("/api/events", async (req, res) => {
 
   // Agents report their own output: a message the adapter carried is filed
   // against the session the event resolved to — and only then, so an
-  // unmatched event files nothing. Blank text is no message.
+  // unmatched event files nothing. Blank text is no message. The origin is
+  // "agent": this is the agent's own reported output, not something typed.
   const messageId =
     typeof message === "string" && message.trim()
-      ? agentMessages.file(name, message)
+      ? agentMessages.file(name, message, "agent")
       : null;
 
   const prev = getEventState(name) || getEventState(paneId);
@@ -2136,7 +2147,7 @@ export function isTrustedSocket({ remoteAddress, localAddress } = {}) {
   });
 }
 
-export { app, agentMessages, surfaceTokens, paneResolution, sessionGroups, launching };
+export { app, agentMessages, surfaceTokens, paneResolution, promptDelivery, sessionGroups, launching };
 if (process.env.NODE_ENV !== "test") {
   // The contract is a public surface: refuse to serve one that lies about a
   // route rather than start with it.

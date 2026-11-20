@@ -61,6 +61,7 @@
         </div>
       </header>
       <div id="peer-status-bar" class="peer-status-bar hidden"></div>
+      <div id="needs-you" class="needs-you hidden"></div>
       <div id="sessions-container" class="sessions-container">
         <div id="sessions-loading" class="empty-state">Loading sessions...</div>
       </div>
@@ -81,6 +82,11 @@
           <span id="terminal-status-dot" class="status-dot"></span>
         </div>
         <span id="terminal-position" class="terminal-position"></span>
+        <button id="chat-toggle-btn" class="icon-btn" title="Chat panel">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+        </button>
         <button id="terminal-reconnect-btn" class="icon-btn" title="Reconnect">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
@@ -92,7 +98,21 @@
           </svg>
         </button>
       </header>
-      <div id="terminal-container"></div>
+      <div id="terminal-body">
+        <div id="terminal-container"></div>
+        <div id="chat-panel" class="chat-panel">
+          <div id="chat-header" class="chat-header">
+            <span id="chat-session-name" class="chat-session-name"></span>
+            <span class="chat-hint">replies are sent as the panel</span>
+          </div>
+          <div id="chat-messages" class="chat-messages"></div>
+          <div id="chat-error" class="chat-error hidden"></div>
+          <form id="chat-composer" class="chat-composer">
+            <textarea id="chat-input" rows="1" placeholder="Reply…"></textarea>
+            <button id="chat-send" type="submit" class="chat-send-btn">Send</button>
+          </form>
+        </div>
+      </div>
       <div id="terminal-toolbar" class="terminal-toolbar" data-mode="normal">
         <div class="toolbar-row normal-btn">
           <button class="toolbar-btn" data-action="paste">Paste</button>
