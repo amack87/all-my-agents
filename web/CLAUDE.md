@@ -40,6 +40,11 @@ launchctl stop com.allmyagents-web && launchctl start com.allmyagents-web
 - **public/sidebar-sync.js** - Pure resolution rules for the sidebar group/order sync. The server imports it too, so both sides resolve the same way.
 - **public/session-order.js** - Pure sidebar order model (groups, ungrouped region, manual order).
 - **public/escape.js** - Pure HTML escaper for every value interpolated into markup.
+- **public/message-origin.js** - The message origin words and the one rule that reads them ("panel" = from the chat panel). Shared with the contract fixture.
+- **public/agent-messages.js** - In-memory per-session message store with a stable id cursor; what GET /api/sessions/:name/message serves.
+- **public/chat-panel.js** - Pure parts of the chat panel: who a message row is from, how a polled page grows the list.
+- **public/panel.js** - The chat panel's DOM: message list beside the terminal, composer that sends with the panel's origin, 1s cursor poll.
+- **public/needs-you.js** - Pure view: the grouped sessions whose status is needsInput, oldest wait first.
 - **public/style.css** - Dark theme, mobile-first responsive layout.
 
 ## Key Constraints
