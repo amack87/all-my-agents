@@ -22,7 +22,6 @@ private struct SidebarGroupsContract: Decodable {
         let name: String
         let data: SidebarOrderData
         let hasGroups: Bool
-        let clearedGroups: Bool
     }
 
     let winnerCases: [WinnerCase]
@@ -72,10 +71,6 @@ private enum ContractFixture {
             SidebarOrder.hasGroups(testCase.data) == testCase.hasGroups,
             "contract case \"\(testCase.name)\": hasGroups disagreed"
         )
-        #expect(
-            SidebarOrder.clearedGroups(testCase.data) == testCase.clearedGroups,
-            "contract case \"\(testCase.name)\": clearedGroups disagreed"
-        )
     }
 }
 
@@ -87,5 +82,52 @@ private enum ContractFixture {
     }
     for name in contract.unsafeGroupNames {
         #expect(!SidebarOrder.isSafeGroupName(name), "\"\(name)\" should be refused as a group name")
+    }
+}
+
+// MARK: - The fields a session carries
+
+/// The session-fields fixture, read from `contract/session-fields.json`.
+/// Each case is a published session payload; this app's session decoder must
+/// resolve its group and directory exactly as the case expects, the same way
+/// the web app's shape check does.
+private struct SessionFieldsContract: Decodable {
+    struct Case: Decodable {
+        let name: String
+        let shape: String
+        let session: MeshAPIClient.MeshSession
+        let expected: Expected
+
+        struct Expected: Decodable {
+            let group: String?
+            let dir: String?
+        }
+    }
+
+    let cases: [Case]
+}
+
+@Test func sessionFieldsFixtureIsPresent() throws {
+    let url = ContractFixture.repoRoot.appendingPathComponent("contract/session-fields.json")
+    #expect(FileManager.default.fileExists(atPath: url.path))
+}
+
+@Test func sessionFieldsContractResolvesIdenticallyToTheWebApp() throws {
+    let url = ContractFixture.repoRoot.appendingPathComponent("contract/session-fields.json")
+    let data = try Data(contentsOf: url)
+    let contract = try JSONDecoder().decode(SessionFieldsContract.self, from: data)
+    #expect(!contract.cases.isEmpty)
+
+    for testCase in contract.cases {
+        let sessions = MeshAPIClient.mapSessions([testCase.session])
+        let session = try #require(sessions.first)
+        #expect(
+            session.group == testCase.expected.group,
+            "contract case \"\(testCase.name)\": expected group \(testCase.expected.group ?? "nil"), got \(session.group ?? "nil")"
+        )
+        #expect(
+            session.dir == testCase.expected.dir,
+            "contract case \"\(testCase.name)\": expected dir \(testCase.expected.dir ?? "nil"), got \(session.dir ?? "nil")"
+        )
     }
 }

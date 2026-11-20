@@ -24,6 +24,8 @@ struct ClaudeSession: Identifiable, Sendable, Equatable {
     let machine: String?       // nil = local-only discovery, "MBP M4" etc. from mesh
     let machineHost: String?   // nil or "local" = this machine, "100.x.x.x:3456" = remote peer
     let task: String?          // what the agent says it is doing right now
+    let group: String?         // which group the server says the session belongs to (ADR 0017)
+    let dir: String?           // the directory the session's pane runs in
 
     /// Whether this session lives on a remote machine (needs WebSocket proxy).
     var isRemote: Bool {

@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
   orderTimestamp,
   orderHasGroups,
-  orderClearedGroups,
   pickWinner,
   isSafeGroupName,
   sanitizeSidebarOrder,
@@ -15,13 +14,6 @@ const filled = () => ({
   collapsed: {},
   order: ["Work"],
   ungroupedOrder: [],
-});
-const cleared = () => ({
-  groups: {},
-  collapsed: {},
-  order: [],
-  ungroupedOrder: [],
-  groupsCleared: true,
 });
 
 test("a copy with groups is not erased by a newer copy without them", () => {
@@ -42,19 +34,17 @@ test("a blank copy never erases the server's groups", () => {
   assert.equal(pickWinner({ data: empty(), updatedAt: 0 }, { data: filled(), updatedAt: 1000 }), "remote");
 });
 
-test("a copy that declares it cleared its groups may replace one that has them", () => {
-  const local = { data: cleared(), updatedAt: 200 };
+test("a newer copy without groups still loses to one that has them", () => {
+  const local = { data: empty(), updatedAt: 200 };
   const remote = { data: filled(), updatedAt: 100 };
-  assert.equal(pickWinner(local, remote), "local");
+  assert.equal(pickWinner(local, remote), "remote");
+  assert.equal(pickWinner(remote, local), "local");
 });
 
-test("orderHasGroups and orderClearedGroups read the group set", () => {
+test("orderHasGroups reads the group set", () => {
   assert.equal(orderHasGroups(filled()), true);
   assert.equal(orderHasGroups(empty()), false);
   assert.equal(orderHasGroups(null), false);
-  assert.equal(orderClearedGroups(cleared()), true);
-  assert.equal(orderClearedGroups(empty()), false);
-  assert.equal(orderClearedGroups(null), false);
 });
 
 test("ties keep the local copy", () => {
@@ -106,17 +96,18 @@ test("a group called __proto__ is dropped rather than changing the prototype", (
   assert.equal(Object.prototype.hasOwnProperty.call(data.groups, "__proto__"), false);
 });
 
-test("the normaliser keeps the groups-cleared flag and drops unsafe names", () => {
+test("the normaliser drops unsafe names", () => {
   const data = sanitizeSidebarOrder({
     groups: { "__proto__": ["local::a"], constructor: ["local::b"], Work: ["local::c"] },
     collapsed: { "__proto__": true, Work: true },
-    order: ["__proto__", "Work"],
-    ungroupedOrder: ["local::d", 42],
-    groupsCleared: true,
+    order: ["__proto__","Work"],
+    ungroupedOrder: ["local::d",42],
   });
   assert.deepEqual(Object.keys(data.groups), ["Work"]);
   assert.deepEqual(Object.keys(data.collapsed), ["Work"]);
   assert.deepEqual(data.order, ["Work"]);
   assert.deepEqual(data.ungroupedOrder, ["local::d"]);
-  assert.equal(data.groupsCleared, true);
+  // Membership is server-declared now (ADR 0017): the erasure flag the
+  // store used to carry is gone with it.
+  assert.equal("groupsCleared" in data, false);
 });

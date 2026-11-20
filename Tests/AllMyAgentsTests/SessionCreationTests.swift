@@ -23,7 +23,9 @@ struct SessionCreationTests {
             lastActivity: nil,
             machine: machine,
             machineHost: machineHost,
-            task: nil
+            task: nil,
+            group: nil,
+            dir: nil
         )
     }
 

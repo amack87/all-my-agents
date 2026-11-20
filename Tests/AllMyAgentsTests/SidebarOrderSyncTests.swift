@@ -18,12 +18,6 @@ private func filledData() -> SidebarOrderData {
     )
 }
 
-private func clearedData() -> SidebarOrderData {
-    var data = SidebarOrderData.empty()
-    data.groupsCleared = true
-    return data
-}
-
 // MARK: - The groups-are-protected rule
 
 @Test func `a copy with groups is not erased by a newer copy without them`() {
@@ -49,11 +43,15 @@ private func clearedData() -> SidebarOrderData {
     #expect(SidebarOrder.pickWinner(local: blank, remote: grouped) == .remote)
 }
 
-@Test func `a copy that declares it cleared its groups may replace one that has them`() {
-    let cleared = SidebarOrderEntry(data: clearedData(), updatedAt: 200)
+// ADR 0017 amends ADR 0006: membership is server-declared, so the erasure
+// flag is gone — a copy without groups can no longer replace one that has
+// them, however new it is.
+@Test func `a newer copy without groups still loses to one that has them`() {
+    let blank = SidebarOrderEntry(data: emptyData(), updatedAt: 200)
     let grouped = SidebarOrderEntry(data: filledData(), updatedAt: 100)
 
-    #expect(SidebarOrder.pickWinner(local: cleared, remote: grouped) == .local)
+    #expect(SidebarOrder.pickWinner(local: blank, remote: grouped) == .remote)
+    #expect(SidebarOrder.pickWinner(local: grouped, remote: blank) == .local)
 }
 
 // MARK: - Helpers
@@ -62,12 +60,6 @@ private func clearedData() -> SidebarOrderData {
     #expect(SidebarOrder.hasGroups(filledData()))
     #expect(!SidebarOrder.hasGroups(emptyData()))
     #expect(!SidebarOrder.hasGroups(nil))
-}
-
-@Test func `clearedGroups reports a deliberate erasure of the last group`() {
-    #expect(SidebarOrder.clearedGroups(clearedData()))
-    #expect(!SidebarOrder.clearedGroups(emptyData()))
-    #expect(!SidebarOrder.clearedGroups(nil))
 }
 
 @Test func `a legacy copy with content counts as timestamp 1, a blank one as 0`() {

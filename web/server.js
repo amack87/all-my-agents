@@ -3,7 +3,7 @@ import expressWs from "express-ws";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { isAbsolute, dirname, join } from "node:path";
 import { access, readFile, readdir } from "node:fs/promises";
 import { accessSync, createWriteStream, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -27,7 +27,7 @@ import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubm
 import { validateSendBody, sendPromptCalls } from "./send-prompt.js";
 import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
 import { isTrustedConnection } from "./network-access.js";
-import { pickWinner, sanitizeSidebarOrder } from "./public/sidebar-sync.js";
+import { pickWinner, sanitizeSidebarOrder, isSafeGroupName } from "./public/sidebar-sync.js";
 import { statusPriority } from "./public/session-status.js";
 import { STATUSES } from "./public/session-status.js";
 import { readSize, CLAIM_FRAME_TYPE } from "./public/terminal-size.js";
@@ -302,6 +302,10 @@ async function launchPane({ name, dir, token, command, timeoutMs = 5000 } = {}) 
   return paneId;
 }
 
+// Indirection is a seam: the suite points the pane launch at a stub so route
+// tests run without a live tmux pane.
+const launching = { pane: launchPane };
+
 // --- Self-Healing ---
 // Tracks spawn/PTY errors. If too many in a sliding window, exits the process
 // so launchd (with KeepAlive) restarts cleanly.
@@ -359,6 +363,30 @@ async function checkPtyHealth() {
 const TMUX_TARGET_RE = /^[a-zA-Z0-9_.%:-]+$/;
 const PEER_HOST_RE = /^[\w.\-]+:\d{1,5}$/;
 
+// A session's directory is an absolute path, bound for tmux argv. Absent,
+// null or empty mean "no directory" — the pane starts where the server does,
+// exactly as before (ADR 0017).
+const MAX_SESSION_DIR_LENGTH = 400;
+
+function validateSessionDir(dir) {
+  if (dir === undefined || dir === null || dir === "") return { ok: true, dir: undefined };
+  if (typeof dir !== "string") return { ok: false, error: "dir must be a string" };
+  if (!isAbsolute(dir)) return { ok: false, error: "dir must be an absolute path" };
+  if (/[\r\n]/.test(dir)) return { ok: false, error: "dir must be a single line" };
+  if (dir.length > MAX_SESSION_DIR_LENGTH) {
+    return { ok: false, error: `dir must be at most ${MAX_SESSION_DIR_LENGTH} characters` };
+  }
+  return { ok: true, dir };
+}
+
+// A session's group is a group name every surface can store: the same rule
+// the sidebar's synced copy applies to a group name.
+function validateSessionGroup(group) {
+  if (group === undefined || group === null || group === "") return { ok: true, group: null };
+  if (!isSafeGroupName(group)) return { ok: false, error: "Invalid group name" };
+  return { ok: true, group };
+}
+
 function validateTarget(res, target) {
   if (!target || !TMUX_TARGET_RE.test(target)) {
     res.status(400).json({ error: "Invalid session target" });
@@ -382,6 +410,17 @@ function validatePeerHost(res, peerHost, config) {
     return false;
   }
   return true;
+}
+
+// Which group a session belongs to. The server declares membership (ADR 0017
+// amends ADR 0006): a session is created into a group through POST /api/sessions,
+// the registry carries it across a restart, and every published session carries
+// it. A group the user arranges in the sidebar's synced store is the group's
+// name and order; membership is read from the sessions themselves.
+const sessionGroups = new Map(); // tmux session name → group name or absent
+
+function currentGroup(name) {
+  return sessionGroups.get(name) ?? null;
 }
 
 // --- The status feed ---
@@ -427,9 +466,22 @@ app.get("/api/sessions", async (_req, res) => {
 
 // Create a new tmux session
 app.post("/api/sessions", async (req, res) => {
-  const { name, command, target } = req.body || {};
+  const { name, command, target, dir, group } = req.body || {};
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     return res.status(400).json({ error: "Invalid session name (alphanumeric, -, _ only)" });
+  }
+  // Where the pane starts. An absolute path only: a relative one would mean
+  // whatever the server's own working directory happens to be, which is not
+  // something a caller can reason about.
+  const validatedDir = validateSessionDir(dir);
+  if (!validatedDir.ok) {
+    return res.status(400).json({ error: validatedDir.error });
+  }
+  // Which group the session joins. Membership is server-declared (ADR 0017
+  // amends ADR 0006), and the name must be one every surface can store.
+  const validatedGroup = validateSessionGroup(group);
+  if (!validatedGroup.ok) {
+    return res.status(400).json({ error: validatedGroup.error });
   }
   // A session may run a launch command instead of a plain shell. That is how
   // AMA reaches a machine it cannot host natively: the pane runs an ssh
@@ -462,7 +514,8 @@ app.post("/api/sessions", async (req, res) => {
       launchCommand = rendered.command;
     }
     surfaceTokens.set(token, name);
-    await launchPane({ name, token, command: launchCommand });
+    if (validatedGroup.group) sessionGroups.set(name, validatedGroup.group);
+    await launching.pane({ name, dir: validatedDir.dir, token, command: launchCommand });
     // The spec is recorded only once the pane exists: recording it first
     // would let a failed launch overwrite the spec of the session that
     // already holds the name.
@@ -474,9 +527,11 @@ app.post("/api/sessions", async (req, res) => {
     // the self-heal counter.
     if (err.duplicateSession) {
       if (token) surfaceTokens.delete(token);
+      sessionGroups.delete(name);
       log("WARN", "Session name already in use", { name });
       return res.status(409).json({ error: "Session name already in use" });
     }
+    sessionGroups.delete(name);
     recordSpawnError(err);
     res.status(500).json({ error: redactTokens(err.message) });
   }
@@ -534,6 +589,11 @@ function loadRegistry() {
   }
 }
 registryCache.registry = loadRegistry();
+// A session that already exists in tmux at boot (so the restore plan skips it)
+// still keeps the group the registry recorded for it.
+for (const s of registryCache.registry?.sessions ?? []) {
+  if (s.group) sessionGroups.set(s.tmux, s.group);
+}
 
 function saveRegistry(registry) {
   const tmp = `${REGISTRY_PATH}.tmp`;
@@ -688,7 +748,7 @@ async function discoverManagedSessions() {
         sessionId = recorded.sessionId;
       }
     }
-      out.push({ name, dir: panePath || null, sessionId, agent, launch: launchSpecs.get(name) ?? null });
+      out.push({ name, dir: panePath || null, sessionId, agent, group: currentGroup(name), launch: launchSpecs.get(name) ?? null });
   }
   return out;
 }
@@ -828,6 +888,10 @@ async function executeRestoreAction(action) {
   // identifiable to its adapter too.
   const token = newSurfaceToken();
   surfaceTokens.set(token, action.name);
+  // The group comes back with the session: membership is carried by the
+  // registry and re-declared here, so a restored pane is published in its
+  // group (ADR 0017).
+  if (action.group) sessionGroups.set(action.name, action.group);
   const launch = { name: action.name, dir: action.dir, token };
   if (action.kind === "relaunch-command") {
     // The pane is defined by its launch spec, not by an agent on this machine.
@@ -967,6 +1031,11 @@ app.post("/api/sessions/:name/rename", async (req, res) => {
     for (const [tok, nm] of surfaceTokens) {
       if (nm === req.params.name) surfaceTokens.set(tok, newName);
     }
+    // The group travels with the session: membership is keyed by tmux name.
+    if (sessionGroups.has(req.params.name)) {
+      sessionGroups.set(newName, sessionGroups.get(req.params.name));
+      sessionGroups.delete(req.params.name);
+    }
     res.json({ ok: true, oldName: req.params.name, newName });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1049,6 +1118,14 @@ const paneResolution = {
 // then overrides screen detection until it goes stale.
 app.post("/api/events", async (req, res) => {
   const { event, sessionId, surfaceToken, message, task } = req.body || {};
+  // Group, dir and state are server-owned (ADR 0017): the session's agent
+  // cannot put itself into a group or declare where its workflow stands, so
+  // the event channel refuses them rather than quietly ignoring them.
+  const eventBody = req.body && typeof req.body === "object" ? req.body : {};
+  const owned = ["group", "dir", "state"].filter((f) => f in eventBody);
+  if (owned.length > 0) {
+    return res.status(400).json({ error: `Server-owned field(s) not accepted: ${owned.join(", ")}` });
+  }
   const malformed =
     typeof event !== "string" || !event ||
     (sessionId !== undefined && (typeof sessionId !== "string" || !sessionId)) ||
@@ -1574,7 +1651,7 @@ async function discoverSessions() {
     const SEP = "|||";
     paneOutput = await tmux(
       "list-panes", "-a", "-F",
-      `#{session_name}${SEP}#{session_group}${SEP}#{pane_id}${SEP}#{pane_tty}${SEP}#{pane_current_command}${SEP}#{window_name}${SEP}#{session_activity}${SEP}#{pane_pid}`
+      `#{session_name}${SEP}#{session_group}${SEP}#{pane_id}${SEP}#{pane_tty}${SEP}#{pane_current_command}${SEP}#{window_name}${SEP}#{session_activity}${SEP}#{pane_pid}${SEP}#{pane_current_path}`
     );
   } catch {
     return [];
@@ -1585,7 +1662,7 @@ async function discoverSessions() {
   const entries = [];
 
   for (const line of lines) {
-    const [sessionName, sessionGroup, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid] = line.split("|||");
+    const [sessionName, sessionGroup, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid, panePath] = line.split("|||");
 
     if (sessionName.startsWith("_ah_")) continue;
 
@@ -1594,7 +1671,7 @@ async function discoverSessions() {
     seen.add(groupKey);
 
     entries.push({
-      sessionName, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid
+      sessionName, paneId, paneTty, currentCmd, windowName, sessionActivity, panePid, panePath
     });
   }
 
@@ -1622,6 +1699,10 @@ async function discoverSessions() {
       agent,
       lastActivity: parseInt(e.sessionActivity, 10) || 0,
       task: currentTask(e.sessionName, e.paneId),
+      // Where the pane actually is, and which group the server says it is in
+      // (ADR 0017). Membership is read from the sessions themselves.
+      dir: e.panePath || null,
+      group: currentGroup(e.sessionName),
     };
   }));
 
@@ -2055,7 +2136,7 @@ export function isTrustedSocket({ remoteAddress, localAddress } = {}) {
   });
 }
 
-export { app, agentMessages, surfaceTokens, paneResolution };
+export { app, agentMessages, surfaceTokens, paneResolution, sessionGroups, launching };
 if (process.env.NODE_ENV !== "test") {
   // The contract is a public surface: refuse to serve one that lies about a
   // route rather than start with it.

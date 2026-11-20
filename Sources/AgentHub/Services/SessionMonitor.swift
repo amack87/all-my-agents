@@ -165,7 +165,9 @@ final class SessionMonitor {
                     lastActivity: tmuxInfo?.activity,
                     machine: nil,
                     machineHost: nil,
-                    task: nil
+                    task: nil,
+                    group: nil,
+                    dir: nil
                 )
             }
 
@@ -193,7 +195,9 @@ final class SessionMonitor {
                     lastActivity: paneInfo.activity,
                     machine: nil,
                     machineHost: nil,
-                    task: nil
+                    task: nil,
+                    group: nil,
+                    dir: nil
                 ))
             }
 

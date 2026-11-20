@@ -1,0 +1,23 @@
+{
+  "note": "Shared contract cases for the fields a session carries: the group it belongs to and the directory its pane runs in (ADR 0017, which amends ADR 0006 — membership is server-declared). Each case names the published shape it conforms to; the session payloads must pass the server's own shape check (web/test/contract.test.js) and decode to the same group and directory in the macOS app's session model (Tests/AllMyAgentsTests/ContractTests.swift). A session without a group or a known directory publishes null. POST /api/events refuses group, dir and state: the session's agent cannot set them.",
+  "cases": [
+    {
+      "name": "a session with a group and a directory",
+      "shape": "session",
+      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory"},
+      "expected": {"group":"Task Factory","dir":"/repos/task-factory"}
+    },
+    {
+      "name": "a session with neither a group nor a known directory",
+      "shape": "session",
+      "session": {"name":"beta","paneId":"%2","tty":"/dev/ttys002","currentCommand":"zsh","windowName":"beta","status":"idle","source":"screen","agent":"shell","lastActivity":1794595438,"group":null,"dir":null},
+      "expected": {"group":null,"dir":null}
+    },
+    {
+      "name": "a mesh session carries the same group and directory",
+      "shape": "meshSession",
+      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory","machine":"andys-macbook-pro","machineHost":"local"},
+      "expected": {"group":"Task Factory","dir":"/repos/task-factory"}
+    }
+  ]
+}

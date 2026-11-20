@@ -160,16 +160,6 @@ test("resolveOrder does not mutate its input", () => {
   assert.deepEqual(input, snapshot);
 });
 
-test("resolveOrder keeps the groups-cleared flag", () => {
-  const input = data({ groupsCleared: true });
-  const out = resolveOrder(input, [sess("a")], (s) => s.key);
-  assert.equal(out.data.groupsCleared, true);
-});
-
-test("resolveOrder does not invent a groups-cleared flag", () => {
-  const out = resolveOrder(data(), [sess("a")], (s) => s.key);
-  assert.equal(out.data.groupsCleared, undefined);
-});
 test("a group name that collides with Object.prototype is never created", () => {
   const moved = moveSession(data(), key("local", "slice"), "__proto__", 0);
   assert.deepEqual(Object.keys(moved.groups), []);

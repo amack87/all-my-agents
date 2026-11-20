@@ -2,9 +2,10 @@ import Testing
 import Foundation
 @testable import AllMyAgents
 
-// The lifecycle of the `groupsCleared` flag — the one statement that lets a
-// copy without groups replace one that has them — plus the normalising the
-// web app's sanitizeSidebarOrder does. See the web repo's
+// The group lifecycle plus the normalising the web app's
+// sanitizeSidebarOrder does. The groupsCleared erasure flag these tests used
+// to pin is gone with the client-owned membership it described (ADR 0017
+// amends ADR 0006: membership is server-declared now). See
 // docs/adr/0006-groups-are-protected.md.
 
 private func makeDefaults() -> UserDefaults {
@@ -21,27 +22,7 @@ private func twoGroupsData() -> SidebarOrderData {
     )
 }
 
-// MARK: - The erasure flag
-
-@Test func `deleting the last group records the erasure`() {
-    let result = SidebarOrder.deletingGroup(twoGroupsData(), name: "Work")
-    #expect(result.groups["Work"] == nil)
-    #expect(result.groupsCleared != true)
-
-    let last = SidebarOrder.deletingGroup(result, name: "Home")
-    #expect(last.groups.isEmpty)
-    #expect(last.groupsCleared == true)
-}
-
-@Test func `creating a group clears an earlier erasure`() {
-    var data = SidebarOrderData.empty()
-    data.groupsCleared = true
-
-    let result = SidebarOrder.moveSession(data, key: "local::a", target: "Work", index: 0)
-
-    #expect(result.groups["Work"] == ["local::a"])
-    #expect(result.groupsCleared == nil)
-}
+// MARK: - Normalising a stored copy
 
 @Test func `an unsafe group name sends the session to the ungrouped region`() {
     let result = SidebarOrder.moveSession(.empty(), key: "local::a", target: "__proto__", index: 0)
@@ -68,16 +49,6 @@ private func twoGroupsData() -> SidebarOrderData {
     #expect(data.collapsed == ["Work": false])
     #expect(data.order == ["Work"])
     #expect(data.ungroupedOrder == ["local::c"])
-}
-
-@Test func `loading carries the erasure flag`() {
-    let defaults = makeDefaults()
-    let raw = """
-    {"groups":{},"collapsed":{},"order":[],"ungroupedOrder":[],"groupsCleared":true}
-    """
-    defaults.set(raw.data(using: .utf8), forKey: SidebarOrder.storageKey)
-
-    #expect(SidebarOrder.load(from: defaults).groupsCleared == true)
 }
 
 @Test func `a reconciled copy keeps the existing timestamp`() {

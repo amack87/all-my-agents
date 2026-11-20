@@ -39,9 +39,6 @@ function normalize(data) {
     ? src.ungroupedOrder.filter((k) => typeof k === "string")
     : [];
   const next = { groups, collapsed, order, ungroupedOrder };
-  // The "I deleted my last group" flag must survive a reconcile, or the intent
-  // is lost on the next render and the group comes back.
-  if (src.groupsCleared === true) next.groupsCleared = true;
   return next;
 }
 

@@ -248,6 +248,8 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
         summary: s.summary ? String(s.summary) : undefined,
         lastActivity: typeof s.lastActivity === "number" ? s.lastActivity : 0,
         task: typeof s.task === "string" ? s.task : null,
+        group: typeof s.group === "string" ? s.group : null,
+        dir: typeof s.dir === "string" ? s.dir : null,
         machine: peer.name,
         machineHost: `${peer.host}:${peer.port || DEFAULT_PORT}`,
       })),
@@ -267,6 +269,8 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
 export async function fetchAllMeshSessions(localSessions, config) {
   const tagged = localSessions.map((s) => ({
     ...s,
+    group: s.group ?? null,
+    dir: s.dir ?? null,
     machine: config.name,
     machineHost: "local",
   }));
