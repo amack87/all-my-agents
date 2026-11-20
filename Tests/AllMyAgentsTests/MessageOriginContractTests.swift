@@ -36,6 +36,7 @@ private enum MessageOriginFixture {
     static let repoRoot = URL(fileURLWithPath: #filePath)
         .deletingLastPathComponent()
         .deletingLastPathComponent()
+        .deletingLastPathComponent()
 
     static let url = repoRoot.appendingPathComponent("contract/message-origin.json")
 
