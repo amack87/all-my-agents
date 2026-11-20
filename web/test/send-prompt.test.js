@@ -11,7 +11,33 @@ test("validateSendBody accepts a plain prompt", () => {
   assert.deepEqual(validateSendBody({ text: "fix the flaky test" }), {
     ok: true,
     text: "fix the flaky test",
+    origin: null,
   });
+});
+
+// The origin travels with the body, and the route files it with the message
+// it delivers. "panel" is the only value accepted: the origin tag exists so a
+// consumer can trust that a panel reply came from the panel, and a tag that
+// accepts any string means nothing. Text typed into a terminal never goes
+// through this route, so it is never tagged at all.
+test("validateSendBody accepts the panel origin and nothing else", () => {
+  assert.deepEqual(validateSendBody({ text: "yes, approved", origin: "panel" }), {
+    ok: true,
+    text: "yes, approved",
+    origin: "panel",
+  });
+  for (const body of [
+    { text: "hi", origin: "terminal" },
+    { text: "hi", origin: "agent" },
+    { text: "hi", origin: "" },
+    { text: "hi", origin: 42 },
+    { text: "hi", origin: ["panel"] },
+    { text: "hi", origin: null },
+  ]) {
+    const result = validateSendBody(body);
+    assert.equal(result.ok, false, `body ${JSON.stringify(body)} is rejected`);
+    assert.equal(typeof result.error, "string", "the rejection carries a message");
+  }
 });
 
 test("validateSendBody rejects a missing, empty, or non-string text", () => {
@@ -37,7 +63,7 @@ test("validateSendBody rejects a missing, empty, or non-string text", () => {
 test("validateSendBody does not trim or otherwise alter the text", () => {
   // The prompt is the agent's own input, byte for byte; whitespace and
   // newlines can be part of what the user meant to send.
-  assert.deepEqual(validateSendBody({ text: "  hi \n" }), { ok: true, text: "  hi \n" });
+  assert.deepEqual(validateSendBody({ text: "  hi \n" }), { ok: true, text: "  hi \n", origin: null });
 });
 
 test("sendPromptCalls types the text literally, then presses Enter", () => {
