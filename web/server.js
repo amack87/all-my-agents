@@ -306,6 +306,11 @@ async function launchPane({ name, dir, token, command, timeoutMs = 5000 } = {}) 
 // tests run without a live tmux pane.
 const launching = { pane: launchPane };
 
+// The same seam for the tmux session commands a route issues itself —
+// rename-session, kill-session. The suite points run at a stub so those
+// route tests run without a live tmux session to rename or kill.
+const tmuxOps = { run: (...args) => tmux(...args) };
+
 // --- Self-Healing ---
 // Tracks spawn/PTY errors. If too many in a sliding window, exits the process
 // so launchd (with KeepAlive) restarts cleanly.
@@ -318,6 +323,9 @@ function redactTokens(message) {
   if (typeof message !== "string") return message;
   let out = message;
   for (const token of surfaceTokens.keys()) {
+    if (token) out = out.split(token).join("[redacted]");
+  }
+  for (const token of ownerTokens.keys()) {
     if (token) out = out.split(token).join("[redacted]");
   }
   return out;
@@ -387,6 +395,26 @@ function validateSessionGroup(group) {
   return { ok: true, group };
 }
 
+// A session's state says where the task's workflow stands (ADR 0017). The
+// vocabulary is Task Factory's — grilling, awaiting approval, done, parked —
+// and the server stores it without interpreting it: it is an opaque string
+// here, bounded the way the other published strings are so no surface is
+// handed something it cannot store or render. Null (or absent) means no
+// declared state.
+const MAX_SESSION_STATE_LENGTH = 64;
+
+function validateSessionState(state) {
+  if (state === undefined || state === null) return { ok: true, state: null };
+  if (typeof state !== "string") return { ok: false, error: "state must be a string" };
+  const trimmed = state.trim();
+  if (!trimmed) return { ok: false, error: "state must be a non-empty string" };
+  if (/[\r\n]/.test(trimmed)) return { ok: false, error: "state must be a single line" };
+  if (trimmed.length > MAX_SESSION_STATE_LENGTH) {
+    return { ok: false, error: `state must be at most ${MAX_SESSION_STATE_LENGTH} characters` };
+  }
+  return { ok: true, state: trimmed };
+}
+
 function validateTarget(res, target) {
   if (!target || !TMUX_TARGET_RE.test(target)) {
     res.status(400).json({ error: "Invalid session target" });
@@ -421,6 +449,29 @@ const sessionGroups = new Map(); // tmux session name → group name or absent
 
 function currentGroup(name) {
   return sessionGroups.get(name) ?? null;
+}
+
+// A session's task state (ADR 0017): where the task's workflow stands. The
+// server owns it — the agent cannot write it (POST /api/events refuses the
+// field) — and it is declared through the API by the workflow that created
+// the session, which proves itself with an owner token.
+const sessionStates = new Map(); // tmux session name → state string or absent
+
+function currentState(name) {
+  return sessionStates.get(name) ?? null;
+}
+
+// Owner tokens (ADR 0018). An opaque per-session secret minted at session
+// creation, returned once in the create response, and able to write that
+// session's state and nothing else. It never appears in a published session
+// shape or in the logs; error text that could embed one is redacted like a
+// surface token's.
+const ownerTokens = new Map(); // owner token → tmux session name
+
+function dropOwnerTokens(name) {
+  for (const [token, bound] of [...ownerTokens]) {
+    if (bound === name) ownerTokens.delete(token);
+  }
 }
 
 // --- The status feed ---
@@ -466,7 +517,7 @@ app.get("/api/sessions", async (_req, res) => {
 
 // Create a new tmux session
 app.post("/api/sessions", async (req, res) => {
-  const { name, command, target, dir, group } = req.body || {};
+  const { name, command, target, dir, group, state } = req.body || {};
   if (!name || !/^[a-zA-Z0-9_-]+$/.test(name)) {
     return res.status(400).json({ error: "Invalid session name (alphanumeric, -, _ only)" });
   }
@@ -482,6 +533,11 @@ app.post("/api/sessions", async (req, res) => {
   const validatedGroup = validateSessionGroup(group);
   if (!validatedGroup.ok) {
     return res.status(400).json({ error: validatedGroup.error });
+  }
+  // The workflow's starting position, if the caller declares one (ADR 0017).
+  const validatedState = validateSessionState(state);
+  if (!validatedState.ok) {
+    return res.status(400).json({ error: validatedState.error });
   }
   // A session may run a launch command instead of a plain shell. That is how
   // AMA reaches a machine it cannot host natively: the pane runs an ssh
@@ -499,10 +555,15 @@ app.post("/api/sessions", async (req, res) => {
     spec = buildLaunchSpec({ command: validated.command });
   }
   let token = null;
+  let ownerToken = null;
   try {
     // Mint a surface token for the new pane and pass it through its environment,
     // so an agent adapter inside the pane can identify itself on /api/events.
     token = newSurfaceToken();
+    // Mint an owner token for the caller (ADR 0018): the secret that may write
+    // this session's task state. It is returned once, below, and appears in
+    // no session shape, log or published contract shape.
+    ownerToken = newSurfaceToken();
     let launchCommand = null;
     if (spec) {
       // The command is built on the server from the mesh config, so the browser
@@ -514,24 +575,30 @@ app.post("/api/sessions", async (req, res) => {
       launchCommand = rendered.command;
     }
     surfaceTokens.set(token, name);
+    ownerTokens.set(ownerToken, name);
     if (validatedGroup.group) sessionGroups.set(name, validatedGroup.group);
+    if (validatedState.state) sessionStates.set(name, validatedState.state);
     await launching.pane({ name, dir: validatedDir.dir, token, command: launchCommand });
     // The spec is recorded only once the pane exists: recording it first
     // would let a failed launch overwrite the spec of the session that
     // already holds the name.
     launchSpecs.set(name, spec);
-    res.json({ ok: true, name, command: launchCommand });
+    res.json({ ok: true, name, command: launchCommand, ownerToken });
   } catch (err) {
     // A name that is already taken is the caller's mistake, not a fault in
     // the server: it is answered as a conflict and it does not count towards
     // the self-heal counter.
     if (err.duplicateSession) {
       if (token) surfaceTokens.delete(token);
+      dropOwnerTokens(name);
       sessionGroups.delete(name);
+      sessionStates.delete(name);
       log("WARN", "Session name already in use", { name });
       return res.status(409).json({ error: "Session name already in use" });
     }
+    dropOwnerTokens(name);
     sessionGroups.delete(name);
+    sessionStates.delete(name);
     recordSpawnError(err);
     res.status(500).json({ error: redactTokens(err.message) });
   }
@@ -593,6 +660,7 @@ registryCache.registry = loadRegistry();
 // still keeps the group the registry recorded for it.
 for (const s of registryCache.registry?.sessions ?? []) {
   if (s.group) sessionGroups.set(s.tmux, s.group);
+  if (s.state) sessionStates.set(s.tmux, s.state);
 }
 
 function saveRegistry(registry) {
@@ -748,7 +816,7 @@ async function discoverManagedSessions() {
         sessionId = recorded.sessionId;
       }
     }
-      out.push({ name, dir: panePath || null, sessionId, agent, group: currentGroup(name), launch: launchSpecs.get(name) ?? null });
+      out.push({ name, dir: panePath || null, sessionId, agent, group: currentGroup(name), state: currentState(name), launch: launchSpecs.get(name) ?? null });
   }
   return out;
 }
@@ -892,6 +960,8 @@ async function executeRestoreAction(action) {
   // registry and re-declared here, so a restored pane is published in its
   // group (ADR 0017).
   if (action.group) sessionGroups.set(action.name, action.group);
+  // The task state comes back with it too (ADR 0017), carried the same way.
+  if (action.state) sessionStates.set(action.name, action.state);
   const launch = { name: action.name, dir: action.dir, token };
   if (action.kind === "relaunch-command") {
     // The pane is defined by its launch spec, not by an agent on this machine.
@@ -1026,15 +1096,25 @@ app.post("/api/sessions/:name/rename", async (req, res) => {
     return res.status(400).json({ error: "Invalid new session name" });
   }
   try {
-    await tmux("rename-session", "-t", req.params.name, newName);
+    await tmuxOps.run("rename-session", "-t", req.params.name, newName);
     // Keep the pane's surface-token binding pointing at the new name.
     for (const [tok, nm] of surfaceTokens) {
       if (nm === req.params.name) surfaceTokens.set(tok, newName);
+    }
+    // The owner token travels with the session too: it still writes the
+    // renamed session's state (ADR 0018).
+    for (const [tok, nm] of ownerTokens) {
+      if (nm === req.params.name) ownerTokens.set(tok, newName);
     }
     // The group travels with the session: membership is keyed by tmux name.
     if (sessionGroups.has(req.params.name)) {
       sessionGroups.set(newName, sessionGroups.get(req.params.name));
       sessionGroups.delete(req.params.name);
+    }
+    // So does the task state.
+    if (sessionStates.has(req.params.name)) {
+      sessionStates.set(newName, sessionStates.get(req.params.name));
+      sessionStates.delete(req.params.name);
     }
     res.json({ ok: true, oldName: req.params.name, newName });
   } catch (err) {
@@ -1071,6 +1151,42 @@ app.post("/api/sessions/:name/group", (req, res) => {
   res.json({ ok: true, name, group: currentGroup(name) });
 });
 
+// Write a session's task state (ADR 0018). The state is the workflow's
+// position, not the agent's words: it may only be written by whoever created
+// the session, proving it with the owner token the create response handed
+// out once. A wrong or missing token is refused — the agent's event route
+// refuses `state` outright, so no surface token can claim a state either.
+// `state: null` clears it. A registry entry for the session is updated
+// immediately, so the declaration survives a restart even before the next
+// reconcile pass.
+app.post("/api/sessions/:name/state", (req, res) => {
+  if (!validateTarget(res, req.params.name)) return;
+  const name = req.params.name;
+  const body = req.body || {};
+  if (!body.ownerToken || ownerTokens.get(body.ownerToken) !== name) {
+    return res.status(401).json({ error: "A valid owner token is required to write a session's state" });
+  }
+  const validated = validateSessionState(body.state);
+  if (!validated.ok) {
+    return res.status(400).json({ error: validated.error });
+  }
+  if (validated.state == null) {
+    sessionStates.delete(name);
+  } else {
+    sessionStates.set(name, validated.state);
+  }
+  const registry = registryCache.registry;
+  const entry = registry?.sessions.find((s) => s.tmux === name);
+  if (entry && entry.state !== validated.state) {
+    registry.sessions = registry.sessions.map((s) =>
+      s.tmux === name ? { ...s, state: validated.state } : s
+    );
+    saveRegistry(registry);
+    log("INFO", "Session state declared", { name, state: validated.state });
+  }
+  res.json({ ok: true, name, state: currentState(name) });
+});
+
 // Deliver a prompt to a session: type the text into the session's pane as the
 // agent's own input, then press Enter, and file the text with the origin the
 // caller declared — a panel reply is recorded as from the panel, a prompt
@@ -1103,11 +1219,14 @@ app.post("/api/sessions/:name/send", async (req, res) => {
 app.delete("/api/sessions/:name", async (req, res) => {
   if (!validateTarget(res, req.params.name)) return;
   try {
-    await tmux("kill-session", "-t", req.params.name);
+    await tmuxOps.run("kill-session", "-t", req.params.name);
     // Drop any surface tokens bound to the dead pane.
     for (const [tok, nm] of [...surfaceTokens]) {
       if (nm === req.params.name) surfaceTokens.delete(tok);
     }
+    // Drop its owner token and its task state with it (ADR 0018).
+    dropOwnerTokens(req.params.name);
+    sessionStates.delete(req.params.name);
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1743,6 +1862,8 @@ async function discoverSessions() {
       // (ADR 0017). Membership is read from the sessions themselves.
       dir: e.panePath || null,
       group: currentGroup(e.sessionName),
+      // Where the task's workflow stands, as the owner last declared it.
+      state: currentState(e.sessionName),
     };
   }));
 
@@ -2176,7 +2297,7 @@ export function isTrustedSocket({ remoteAddress, localAddress } = {}) {
   });
 }
 
-export { app, agentMessages, surfaceTokens, paneResolution, promptDelivery, sessionGroups, launching };
+export { app, agentMessages, surfaceTokens, paneResolution, promptDelivery, sessionGroups, sessionStates, ownerTokens, currentState, launching, tmuxOps };
 if (process.env.NODE_ENV !== "test") {
   // The contract is a public surface: refuse to serve one that lies about a
   // route rather than start with it.

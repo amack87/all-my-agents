@@ -144,20 +144,20 @@ test("checkShape accepts a response that conforms to its declared shape", () => 
     [],
   );
   assert.deepEqual(
-    checkShape("createdSession", { ok: true, name: "slice", command: null }, shapeCtx),
+    checkShape("createdSession", { ok: true, name: "slice", command: null, ownerToken: "own-slice" }, shapeCtx),
     [],
   );
 });
 
 test("checkShape flags a declared field that is missing", () => {
-  const { command: _omitted, ...short } = { ok: true, name: "slice", command: null };
+  const { command: _omitted, ...short } = { ok: true, name: "slice", command: null, ownerToken: "own-slice" };
   const problems = checkShape("createdSession", short, shapeCtx);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /command/);
 });
 
 test("checkShape flags a declared field of the wrong type", () => {
-  const problems = checkShape("createdSession", { ok: "yes", name: "slice", command: null }, shapeCtx);
+  const problems = checkShape("createdSession", { ok: "yes", name: "slice", command: null, ownerToken: "own-slice" }, shapeCtx);
   assert.equal(problems.length, 1);
   assert.match(problems[0], /ok/);
 });
@@ -166,7 +166,7 @@ test("checkShape flags a field the shape does not declare", () => {
   // That is the point of publishing: a new field is a deliberate act.
   const problems = checkShape(
     "createdSession",
-    { ok: true, name: "slice", command: null, surprise: 1 },
+    { ok: true, name: "slice", command: null, ownerToken: "own-slice", surprise: 1 },
     shapeCtx,
   );
   assert.equal(problems.length, 1);
@@ -282,9 +282,9 @@ test("the shape guard stays quiet on a conforming response", async () => {
   const problems = [];
   const app = express();
   app.use(createShapeGuard(contract, contract.statuses.vocabulary, { onProblem: (p) => problems.push(p) }));
-  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null }));
+  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null, ownerToken: "own-slice" }));
   const { payload } = await call(app, "POST", "/api/sessions");
-  assert.deepEqual(payload, { ok: true, name: "slice", command: null });
+  assert.deepEqual(payload, { ok: true, name: "slice", command: null, ownerToken: "own-slice" });
   assert.deepEqual(problems, []);
 });
 
@@ -292,7 +292,7 @@ test("the shape guard surfaces a response that breaks its declared shape", async
   const problems = [];
   const app = express();
   app.use(createShapeGuard(contract, contract.statuses.vocabulary, { onProblem: (p) => problems.push(...p) }));
-  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null, surprise: 1 }));
+  app.post("/api/sessions", (_req, res) => res.json({ ok: true, name: "slice", command: null, ownerToken: "own-slice", surprise: 1 }));
   await call(app, "POST", "/api/sessions");
   assert.equal(problems.length, 1);
   assert.match(problems[0], /surprise/);
@@ -403,7 +403,7 @@ test("the contract publishes the promptPeerSession route, and its shape is sendA
     path: "/api/proxy/{peerHost}/sessions/{name}/send",
     shape: "sendAck",
   });
-  assert.equal(contract.version, "9", "a change to the published routes is a version bump");
+  assert.equal(contract.version, "10", "a change to the published routes is a version bump");
 
   // Declaring membership after creation: dragging a tile into or out of a
   // group is this server write (ADR 0017), and the ack carries the group the
@@ -419,6 +419,22 @@ test("the contract publishes the promptPeerSession route, and its shape is sendA
   );
   assert.deepEqual(
     checkShape("sessionGroup", { ok: true, name: "work", group: null }, shapeCtx),
+    [],
+  );
+
+  // Writing a session's task state: the owner's write (ADR 0018), acked with
+  // the state the server now stores — null when it was cleared.
+  assert.deepEqual(contract.routes.setSessionState, {
+    method: "POST",
+    path: "/api/sessions/{name}/state",
+    shape: "sessionState",
+  });
+  assert.deepEqual(
+    checkShape("sessionState", { ok: true, name: "work", state: "executing" }, shapeCtx),
+    [],
+  );
+  assert.deepEqual(
+    checkShape("sessionState", { ok: true, name: "work", state: null }, shapeCtx),
     [],
   );
 
@@ -455,7 +471,7 @@ test("the contract publishes the peer read routes", () => {
     path: "/api/proxy/{peerHost}/sessions/{target}/capture",
     shape: "capture",
   });
-  assert.equal(contract.version, "9", "a change to the published routes is a version bump");
+  assert.equal(contract.version, "10", "a change to the published routes is a version bump");
 
   assert.deepEqual(
     checkShape("agentMessageList", { messages: [{ id: 7, text: "done", at: 2, origin: null }] }, shapeCtx),

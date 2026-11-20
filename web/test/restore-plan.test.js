@@ -20,8 +20,8 @@ test("resumes each entry when its session id resolves", () => {
   });
 
   assert.deepEqual(actions, [
-    { kind: "launch-opencode", name: "ama-stuff", dir: "/repos/all-my-agents-web", group: null, sessionId: "ses_aaa", continueBest: false, reason: "resume" },
-    { kind: "launch-opencode", name: "fix-bug", dir: "/repos/other", group: null, sessionId: "ses_bbb", continueBest: false, reason: "resume" },
+    { kind: "launch-opencode", name: "ama-stuff", dir: "/repos/all-my-agents-web", group: null, state: null, sessionId: "ses_aaa", continueBest: false, reason: "resume" },
+    { kind: "launch-opencode", name: "fix-bug", dir: "/repos/other", group: null, state: null, sessionId: "ses_bbb", continueBest: false, reason: "resume" },
   ]);
 });
 
@@ -50,7 +50,7 @@ test("degrades when the entry never had a session id", () => {
 
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
   assert.deepEqual(actions, [
-    { kind: "launch-opencode", name: "fresh", dir: "/repos/fresh", group: null, sessionId: null, continueBest: true, reason: "degrade" },
+    { kind: "launch-opencode", name: "fresh", dir: "/repos/fresh", group: null, state: null, sessionId: null, continueBest: true, reason: "degrade" },
   ]);
 });
 
@@ -84,7 +84,7 @@ test("plans a bare-shell recreate for a non-opencode entry", () => {
 
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
   assert.deepEqual(actions, [
-    { kind: "recreate-shell", name: "scratch", dir: "/tmp/scratch", agent: "shell", group: null, reason: "recreate-shell" },
+    { kind: "recreate-shell", name: "scratch", dir: "/tmp/scratch", agent: "shell", group: null, state: null, reason: "recreate-shell" },
   ]);
 });
 
@@ -99,7 +99,7 @@ test("plans a bare-shell recreate for a still-unclassified entry", () => {
 
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
   assert.deepEqual(actions, [
-    { kind: "recreate-shell", name: "unclear", dir: null, agent: null, group: null, reason: "recreate-shell" },
+    { kind: "recreate-shell", name: "unclear", dir: null, agent: null, group: null, state: null, reason: "recreate-shell" },
   ]);
 });
 
@@ -116,7 +116,7 @@ test("a shell entry is never resumed even when it carries a session id", () => {
 
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set(["ses_stale"]) });
   assert.deepEqual(actions, [
-    { kind: "recreate-shell", name: "stale", dir: "/repos/x", agent: "shell", group: null, reason: "recreate-shell" },
+    { kind: "recreate-shell", name: "stale", dir: "/repos/x", agent: "shell", group: null, state: null, reason: "recreate-shell" },
   ]);
 });
 
@@ -140,7 +140,7 @@ test("resumes a Claude Code entry when its transcript resolves", () => {
   });
 
   assert.deepEqual(actions, [
-    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, sessionId: CLAUDE_ID, reason: "resume" },
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, state: null, sessionId: CLAUDE_ID, reason: "resume" },
   ]);
 });
 
@@ -154,7 +154,7 @@ test("degrades a Claude Code entry to a fresh claude when the transcript is gone
   });
 
   assert.deepEqual(actions, [
-    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, sessionId: null, reason: "degrade" },
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, state: null, sessionId: null, reason: "degrade" },
   ]);
 });
 
@@ -166,7 +166,7 @@ test("a Claude Code entry that never captured an id still launches claude", () =
   });
 
   assert.deepEqual(actions, [
-    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, sessionId: null, reason: "degrade" },
+    { kind: "launch-claude", name: "questions", dir: "/home/example/project", group: null, state: null, sessionId: null, reason: "degrade" },
   ]);
 });
 test("a session with a launch spec is relaunched rather than resumed", () => {
@@ -179,7 +179,7 @@ test("a session with a launch spec is relaunched rather than resumed", () => {
   };
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
   assert.deepEqual(actions, [
-    { kind: "relaunch-command", name: "win", dir: null, group: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+    { kind: "relaunch-command", name: "win", dir: null, group: null, state: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
   ]);
 });
 
@@ -193,7 +193,7 @@ test("a launch spec takes precedence over a resumable agent", () => {
   };
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set(["ses_aaa"]) });
   assert.deepEqual(actions, [
-    { kind: "relaunch-command", name: "win", dir: "/repos/a", group: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+    { kind: "relaunch-command", name: "win", dir: "/repos/a", group: null, state: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
   ]);
 });
 
@@ -210,7 +210,7 @@ test("a restored entry carries the group the registry recorded", () => {
   };
   const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
   assert.deepEqual(actions, [
-    { kind: "recreate-shell", name: "task-slice", dir: "/repos/task-factory", agent: "shell", group: "Task Factory", reason: "recreate-shell" },
-    { kind: "relaunch-command", name: "win", dir: "/repos/a", group: "Work", launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+    { kind: "recreate-shell", name: "task-slice", dir: "/repos/task-factory", agent: "shell", group: "Task Factory", state: null, reason: "recreate-shell" },
+    { kind: "relaunch-command", name: "win", dir: "/repos/a", group: "Work", state: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
   ]);
 });

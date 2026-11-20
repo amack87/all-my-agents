@@ -250,6 +250,7 @@ export async function fetchPeerSessions(peer, timeoutMs = 10000) {
         task: typeof s.task === "string" ? s.task : null,
         group: typeof s.group === "string" ? s.group : null,
         dir: typeof s.dir === "string" ? s.dir : null,
+        state: typeof s.state === "string" ? s.state : null,
         machine: peer.name,
         machineHost: `${peer.host}:${peer.port || DEFAULT_PORT}`,
       })),
@@ -271,6 +272,7 @@ export async function fetchAllMeshSessions(localSessions, config) {
     ...s,
     group: s.group ?? null,
     dir: s.dir ?? null,
+    state: s.state ?? null,
     machine: config.name,
     machineHost: "local",
   }));

@@ -17,7 +17,7 @@ export function snapshotSignature(snapshot) {
   const sessions = (snapshot?.sessions ?? [])
     .map(
       (s) =>
-        `${s.name}|${s.paneId ?? ""}|${s.status}|${s.agent ?? ""}|${s.lastActivity ?? 0}|${s.task ?? ""}|${s.group ?? ""}`,
+        `${s.name}|${s.paneId ?? ""}|${s.status}|${s.agent ?? ""}|${s.lastActivity ?? 0}|${s.task ?? ""}|${s.group ?? ""}|${s.state ?? ""}`,
     )
     .sort()
     .join("\n");

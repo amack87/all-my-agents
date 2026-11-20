@@ -1,23 +1,28 @@
 {
-  "note": "Shared contract cases for the fields a session carries: the group it belongs to and the directory its pane runs in (ADR 0017, which amends ADR 0006 — membership is server-declared). Each case names the published shape it conforms to; the session payloads must pass the server's own shape check (web/test/contract.test.js) and decode to the same group and directory in the macOS app's session model (Tests/AllMyAgentsTests/ContractTests.swift). A session without a group or a known directory publishes null. POST /api/events refuses group, dir and state: the session's agent cannot set them.",
+  "note": "Shared contract cases for the fields a session carries: the group it belongs to, the directory its pane runs in and the task state the workflow's owner declared (ADR 0017, which amends ADR 0006 — membership is server-declared; ADR 0018 — state is written with an owner token). Each case names the published shape it conforms to; the session payloads must pass the server's own shape check (web/test/contract.test.js) and decode to the same group, directory and state in the macOS app's session model (Tests/AllMyAgentsTests/ContractTests.swift). A session without a group, a known directory or a declared state publishes null. POST /api/events refuses group, dir and state: the session's agent cannot set them.",
   "cases": [
     {
       "name": "a session with a group and a directory",
       "shape": "session",
-      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory"},
-      "expected": {"group":"Task Factory","dir":"/repos/task-factory"}
+      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory","state":"executing"},
+      "expected": {"group":"Task Factory","dir":"/repos/task-factory","state":"executing"}
     },
     {
       "name": "a session with neither a group nor a known directory",
       "shape": "session",
-      "session": {"name":"beta","paneId":"%2","tty":"/dev/ttys002","currentCommand":"zsh","windowName":"beta","status":"idle","source":"screen","agent":"shell","lastActivity":1794595438,"group":null,"dir":null},
-      "expected": {"group":null,"dir":null}
+      "session": {"name":"beta","paneId":"%2","tty":"/dev/ttys002","currentCommand":"zsh","windowName":"beta","status":"idle","source":"screen","agent":"shell","lastActivity":1794595438,"group":null,"dir":null,"state":null},
+      "expected": {"group":null,"dir":null,"state":null}
     },
     {
       "name": "a mesh session carries the same group and directory",
       "shape": "meshSession",
-      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory","machine":"andys-macbook-pro","machineHost":"local"},
-      "expected": {"group":"Task Factory","dir":"/repos/task-factory"}
+      "session": {"name":"alpha","paneId":"%1","tty":"/dev/ttys001","currentCommand":"claude","windowName":"alpha","status":"working","source":"event","agent":"Claude Code","lastActivity":1794595437,"group":"Task Factory","dir":"/repos/task-factory","machine":"andys-macbook-pro","machineHost":"local","state":"executing"},
+      "expected": {"group":"Task Factory","dir":"/repos/task-factory","state":"executing"}},
+    {
+      "name": "a session carries a task state on its own",
+      "shape": "session",
+      "session": {"name":"gamma","paneId":"%3","tty":"/dev/ttys003","currentCommand":"zsh","windowName":"gamma","status":"idle","source":"screen","agent":"shell","lastActivity":1794595439,"group":null,"dir":null,"state":"grilling"},
+      "expected": {"group":null,"dir":null,"state":"grilling"}
     }
   ]
 }

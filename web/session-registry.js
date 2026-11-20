@@ -21,8 +21,8 @@ export const REGISTRY_VERSION = 2;
 // single transient miss never drops a session that restore should replay.
 const MISSES_TO_PRUNE = 2;
 
-// live entries come from discovery: { name, dir, group, sessionId, agent, launch }
-// registry entries are:               { tmux, dir, group, sessionId, agent, launch, firstSeen, lastActive, misses }
+// live entries come from discovery: { name, dir, group, state, sessionId, agent, launch }
+// registry entries are:               { tmux, dir, group, state, sessionId, agent, launch, firstSeen, lastActive, misses }
 //
 // Returns { registry, changed, removed }.
 // - `removed` lists prior entries pruned as no longer running (absent across
@@ -59,6 +59,7 @@ export function reconcileRegistry(live, prior, now) {
         tmux: prev.tmux,
         dir: prev.dir ?? null,
         group: prev.group ?? null,
+        state: prev.state ?? null,
         sessionId: prev.sessionId ?? null,
         agent: prev.agent ?? null,
         launch: prev.launch ?? null,
@@ -73,6 +74,7 @@ export function reconcileRegistry(live, prior, now) {
       tmux: prev.tmux,
       dir: liveEntry.dir ?? prev.dir ?? null,
       group: liveEntry.group ?? prev.group ?? null,
+      state: liveEntry.state ?? prev.state ?? null,
       sessionId: liveEntry.sessionId ?? prev.sessionId ?? null,
       agent: liveEntry.agent ?? prev.agent,
       launch: liveEntry.launch ?? prev.launch ?? null,
@@ -88,6 +90,7 @@ export function reconcileRegistry(live, prior, now) {
       tmux: liveEntry.name,
       dir: liveEntry.dir ?? null,
       group: liveEntry.group ?? null,
+      state: liveEntry.state ?? null,
       sessionId: liveEntry.sessionId ?? null,
       agent: liveEntry.agent ?? null,
       launch: liveEntry.launch ?? null,
@@ -117,9 +120,11 @@ function sessionsSnapshot(registry) {
     // `lastActive` moves on its own, so it is not part of the comparison.
     const { lastActive, ...rest } = s;
     // `launch` is normalised to null so an entry written before launch specs
-    // existed compares equal to one with no spec. The keys are sorted so the
+    // existed compares equal to one with no spec. So is `state`: an entry
+    // written before a task state could be declared compares equal to one
+    // that has never declared one. The keys are sorted so the
     // two sides serialise identically no matter which order they were built in.
-    const normalized = { ...rest, launch: rest.launch ?? null };
+    const normalized = { ...rest, launch: rest.launch ?? null, state: rest.state ?? null };
     return Object.fromEntries(
       Object.keys(normalized).sort().map((k) => [k, normalized[k]])
     );
