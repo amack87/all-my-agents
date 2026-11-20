@@ -403,7 +403,7 @@ test("the contract publishes the promptPeerSession route, and its shape is sendA
     path: "/api/proxy/{peerHost}/sessions/{name}/send",
     shape: "sendAck",
   });
-  assert.equal(contract.version, "6", "a change to the published routes is a version bump");
+  assert.equal(contract.version, "7", "a change to the published routes is a version bump");
 
   assert.deepEqual(
     checkShape("sendAck", { ok: true, name: "work", paneId: "%3" }, shapeCtx),
@@ -438,7 +438,7 @@ test("the contract publishes the peer read routes", () => {
     path: "/api/proxy/{peerHost}/sessions/{target}/capture",
     shape: "capture",
   });
-  assert.equal(contract.version, "6", "a change to the published routes is a version bump");
+  assert.equal(contract.version, "7", "a change to the published routes is a version bump");
 
   assert.deepEqual(
     checkShape("agentMessageList", { messages: [{ id: 7, text: "done", at: 2 }] }, shapeCtx),

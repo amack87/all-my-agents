@@ -78,7 +78,9 @@ struct StatusFeedClientTests {
             lastActivity: 1794595437,
             machine: "andys-macbook-pro",
             machineHost: "local",
-            task: "Build feature X"
+            task: "Build feature X",
+            group: "Work",
+            dir: "/repos/x"
         )
         let fromHTTP = MeshAPIClient.mapSessions([mesh])
         let payload = """
@@ -102,6 +104,8 @@ struct StatusFeedClientTests {
         #expect(http.machine == feed.machine)
         #expect(http.machineHost == feed.machineHost)
         #expect(http.lastActivity == feed.lastActivity)
+        #expect(http.group == "Work")
+        #expect(http.dir == "/repos/x")
     }
 
     @Test("a session without a machine host still gets a unique id")
@@ -116,7 +120,9 @@ struct StatusFeedClientTests {
             lastActivity: nil,
             machine: nil,
             machineHost: nil,
-            task: nil
+            task: nil,
+            group: nil,
+            dir: nil
         )
         let sessions = MeshAPIClient.mapSessions([mesh])
         #expect(sessions.first?.id == "mesh-local-alpha")

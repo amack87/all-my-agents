@@ -18,10 +18,18 @@ import {
   orderClearedGroups,
   isSafeGroupName,
 } from "../public/sidebar-sync.js";
+import { checkShape } from "../api-contract.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const contractPath = join(here, "..", "..", "contract", "sidebar-groups.json");
 const contract = JSON.parse(readFileSync(contractPath, "utf8"));
+const apiContract = JSON.parse(
+  readFileSync(join(here, "..", "..", "contract", "api-contract.json"), "utf8"),
+);
+const sessionFieldsPath = join(here, "..", "..", "contract", "session-fields.json");
+const sessionFields = JSON.parse(readFileSync(sessionFieldsPath, "utf8"));
+
+const shapeCtx = { shapes: apiContract.shapes, vocabulary: apiContract.statuses.vocabulary };
 
 test("the shared contract fixture is present", () => {
   assert.ok(Array.isArray(contract.winnerCases));
@@ -55,5 +63,24 @@ test("the shared contract's group names agree", () => {
   }
   for (const name of contract.unsafeGroupNames) {
     assert.equal(isSafeGroupName(name), false, `"${name}" should be refused as a group name`);
+  }
+});
+
+// The fields a session carries — its group and its directory — are published
+// wherever a session is published. Each fixture case conforms to the named
+// published shape, and the server resolves the fields as the case expects.
+test("the shared session-fields contract conforms to the published shapes", () => {
+  assert.ok(Array.isArray(sessionFields.cases));
+  assert.ok(sessionFields.cases.length > 0);
+  for (const c of sessionFields.cases) {
+    const problems = checkShape(c.shape, c.session, shapeCtx);
+    assert.deepEqual(problems, [], `contract case "${c.name}": shape problems`);
+  }
+});
+
+test("the shared session-fields contract resolves identically on the macOS app", () => {
+  for (const c of sessionFields.cases) {
+    assert.equal(c.session.group, c.expected.group, `contract case "${c.name}": group`);
+    assert.equal(c.session.dir, c.expected.dir, `contract case "${c.name}": dir`);
   }
 });

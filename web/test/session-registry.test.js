@@ -30,7 +30,7 @@ test("unchanged live set produces no change and keeps firstSeen", () => {
     version: REGISTRY_VERSION,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode" }];
@@ -49,7 +49,7 @@ test("a changed live field marks the registry changed", () => {
     version: REGISTRY_VERSION,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/moved", sessionId: "ses_1", agent: "opencode" }];
@@ -66,7 +66,7 @@ test("keeps the prior sessionId when live temporarily can't resolve one (no-regr
     version: REGISTRY_VERSION,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/a", sessionId: null, agent: "opencode" }];
@@ -82,7 +82,7 @@ test("adopts a new sessionId on positive evidence", () => {
     version: REGISTRY_VERSION,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/a", sessionId: "ses_2", agent: "opencode" }];
@@ -98,7 +98,7 @@ test("removes entries only after a grace window of two consecutive misses", () =
     version: REGISTRY_VERSION,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
       { tmux: "gone", dir: "/repos/g", sessionId: "ses_2", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
@@ -150,7 +150,7 @@ test("a stale registry version forces a change", () => {
     version: 0,
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode" }];
@@ -177,7 +177,7 @@ test("a grace miss keeps the shell classification (only liveness drives misses)"
     updatedAt: "2026-09-01T11:00:00.000Z",
     sessions: [
       { tmux: "scratch", dir: "/tmp/scratch", sessionId: null, agent: "shell", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
-      { tmux: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
+      { tmux: "ama-stuff", dir: "/repos/a", group: null, sessionId: "ses_1", agent: "opencode", firstSeen: NOW, lastActive: "2026-09-01T11:00:00.000Z", misses: 0 },
     ],
   };
   const live = [{ name: "ama-stuff", dir: "/repos/a", sessionId: "ses_1", agent: "opencode" }];

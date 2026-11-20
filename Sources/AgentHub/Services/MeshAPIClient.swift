@@ -21,6 +21,11 @@ enum MeshAPIClient {
         let machine: String?
         let machineHost: String?
         let task: String?
+        /// Which group the server says this session belongs to (ADR 0017);
+        /// nil when the session is in no group.
+        let group: String?
+        /// The directory the session's pane runs in; nil when unknown.
+        let dir: String?
     }
 
     /// Fetch sessions from the web server. Returns nil if the server is unreachable or returns invalid data.
@@ -73,7 +78,9 @@ enum MeshAPIClient {
                 lastActivity: activity,
                 machine: s.machine,
                 machineHost: s.machineHost,
-                task: s.task
+                task: s.task,
+                group: s.group,
+                dir: s.dir
             )
         }
     }

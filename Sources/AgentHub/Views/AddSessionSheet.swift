@@ -242,7 +242,9 @@ struct AddSessionSheet: View {
                             lastActivity: nil,
                             machine: machineLabel,
                             machineHost: machineHost,
-                            task: nil
+                            task: nil,
+                            group: nil,
+                            dir: nil
                         )
                     dismiss()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -320,7 +322,9 @@ struct AddSessionSheet: View {
                     lastActivity: nil,
                     machine: nil,
                     machineHost: nil,
-                    task: nil
+                    task: nil,
+                    group: nil,
+                    dir: nil
                 )
             dismiss()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -510,7 +514,9 @@ struct AddSessionSheet: View {
                 lastActivity: nil,
                 machine: nil,
                 machineHost: nil,
-                task: nil
+                task: nil,
+                group: nil,
+                dir: nil
             )
             dismiss()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -566,7 +572,9 @@ struct AddSessionSheet: View {
                 lastActivity: nil,
                 machine: nil,
                 machineHost: nil,
-                task: nil
+                task: nil,
+                group: nil,
+                dir: nil
             )
             dismiss()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {

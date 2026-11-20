@@ -21,8 +21,8 @@ export const REGISTRY_VERSION = 2;
 // single transient miss never drops a session that restore should replay.
 const MISSES_TO_PRUNE = 2;
 
-// live entries come from discovery: { name, dir, sessionId, agent, launch }
-// registry entries are:               { tmux, dir, sessionId, agent, launch, firstSeen, lastActive, misses }
+// live entries come from discovery: { name, dir, group, sessionId, agent, launch }
+// registry entries are:               { tmux, dir, group, sessionId, agent, launch, firstSeen, lastActive, misses }
 //
 // Returns { registry, changed, removed }.
 // - `removed` lists prior entries pruned as no longer running (absent across
@@ -58,6 +58,7 @@ export function reconcileRegistry(live, prior, now) {
       next.push({
         tmux: prev.tmux,
         dir: prev.dir ?? null,
+        group: prev.group ?? null,
         sessionId: prev.sessionId ?? null,
         agent: prev.agent ?? null,
         launch: prev.launch ?? null,
@@ -71,6 +72,7 @@ export function reconcileRegistry(live, prior, now) {
     next.push({
       tmux: prev.tmux,
       dir: liveEntry.dir ?? prev.dir ?? null,
+      group: liveEntry.group ?? prev.group ?? null,
       sessionId: liveEntry.sessionId ?? prev.sessionId ?? null,
       agent: liveEntry.agent ?? prev.agent,
       launch: liveEntry.launch ?? prev.launch ?? null,
@@ -85,6 +87,7 @@ export function reconcileRegistry(live, prior, now) {
     next.push({
       tmux: liveEntry.name,
       dir: liveEntry.dir ?? null,
+      group: liveEntry.group ?? null,
       sessionId: liveEntry.sessionId ?? null,
       agent: liveEntry.agent ?? null,
       launch: liveEntry.launch ?? null,

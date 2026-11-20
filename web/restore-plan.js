@@ -30,12 +30,13 @@ export function buildRestorePlan({ registry, existingTmux = [], resolvable = new
     if (entry.launch) {
       // A launch spec owns the pane: re-running it is what restores the
       // session. Whatever runs inside it is the far side's business.
-      actions.push({ kind: "relaunch-command", name: entry.tmux, dir: entry.dir, launch: entry.launch, reason: "relaunch" });
+      actions.push({ kind: "relaunch-command", name: entry.tmux, dir: entry.dir, group: entry.group ?? null, launch: entry.launch, reason: "relaunch" });
     } else if (canResume && isOpencode) {
       actions.push({
         kind: "launch-opencode",
         name: entry.tmux,
         dir: entry.dir,
+        group: entry.group ?? null,
         sessionId: entry.sessionId,
         continueBest: false,
         reason: "resume",
@@ -45,6 +46,7 @@ export function buildRestorePlan({ registry, existingTmux = [], resolvable = new
         kind: "launch-opencode",
         name: entry.tmux,
         dir: entry.dir,
+        group: entry.group ?? null,
         sessionId: null,
         continueBest: true,
         reason: "degrade",
@@ -53,6 +55,7 @@ export function buildRestorePlan({ registry, existingTmux = [], resolvable = new
       actions.push({
         kind: "launch-claude",
         name: entry.tmux,
+        group: entry.group ?? null,
         dir: entry.dir,
         sessionId: canResume ? entry.sessionId : null,
         reason: canResume ? "resume" : "degrade",
@@ -63,6 +66,7 @@ export function buildRestorePlan({ registry, existingTmux = [], resolvable = new
         name: entry.tmux,
         dir: entry.dir,
         agent: entry.agent ?? null,
+        group: entry.group ?? null,
         reason: "recreate-shell",
       });
     }
