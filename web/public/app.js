@@ -12,6 +12,17 @@ import { esc } from "./escape.js";
 import { taskHtml } from "./session-task.js";
 import { statusLabel } from "./session-status.js";
 
+// --- Chat panel and "Needs you" ---
+import { needsYou, waitedFor } from "./needs-you.js";
+import {
+  initChatPanel,
+  chatPanelClose,
+  chatPanelToggle,
+  chatPanelSync,
+  chatPanelDetach,
+  chatPanelIsOpen,
+} from "./panel.js";
+
 // --- Theme Helpers ---
 function getTerminalTheme() {
   const isLight = window.matchMedia("(prefers-color-scheme: light)").matches;
@@ -578,6 +589,7 @@ async function loadSessions() {
     }
     renderPeerStatus();
     renderSessions();
+    renderNeedsYou();
     if (state.activeSession) updatePositionIndicator();
   } catch {
     state.sessionLoadFailures++;
@@ -614,6 +626,29 @@ function renderSessionCard(s, showMachineLabel) {
         </div>
       </div>
     </div>`;
+}
+
+// "Needs you": the grouped sessions waiting on James, oldest wait first. It
+// is a view — rendering it changes nothing; tapping an entry just opens that
+// session's terminal, the same as tapping its tile would.
+function renderNeedsYou() {
+  const el = $("#needs-you");
+  const list = needsYou(state.sessions);
+  if (list.length === 0) {
+    el.classList.add("hidden");
+    el.innerHTML = "";
+    return;
+  }
+  el.classList.remove("hidden");
+  const now = Date.now();
+  el.innerHTML = `
+    <div class="needs-you-title">Needs you</div>
+    ${list.map((s) => `
+      <button class="needs-you-item" data-name="${esc(s.name)}" data-host="${esc(s.machineHost || "local")}">
+        <span class="needs-you-name">${esc(s.name)}</span>
+        <span class="needs-you-meta">${esc(s.group)} · waiting ${esc(waitedFor(s, now))}</span>
+      </button>`).join("")}
+  `;
 }
 
 function renderSessions() {
@@ -1531,6 +1566,10 @@ function openTerminal(sessionName, machineHost = "local") {
 
   // Setup toolbar
   setupToolbar("#terminal-view .terminal-toolbar", term);
+
+  // The chat panel follows the session the terminal shows. If it is open it
+  // retargets onto this session; if not, it stays shut until asked.
+  chatPanelSync(sessionName, machineHost);
 }
 
 function scheduleTerminalReconnect(sessionName, machineHost) {
@@ -1726,6 +1765,7 @@ function connectWebSocket(sessionName, term, fitAddon, machineHost = "local", vi
 
 function cleanupTerminal() {
   stopClaimHeartbeat();
+  chatPanelDetach();
   if (state.terminalReconnectTimer) {
     clearTimeout(state.terminalReconnectTimer);
     state.terminalReconnectTimer = null;
@@ -1772,6 +1812,7 @@ function reconnectTerminal() {
 
 function closeTerminal() {
   cleanupTerminal();
+  chatPanelClose();
   state.activeSession = null;
   state.activeSessionMeta = null;
   document.querySelectorAll(".session-card.active").forEach((c) => c.classList.remove("active"));
@@ -2273,6 +2314,7 @@ async function renameSessionAction(sessionName, machineHost) {
 }
 
 // --- Event Bindings ---
+initChatPanel({ url: apiUrl });
 $("#back-btn").addEventListener("click", closeTerminal);
 $("#add-session-btn").addEventListener("click", showNewSessionModal);
 $("#modal-cancel").addEventListener("click", hideNewSessionModal);
@@ -2280,10 +2322,21 @@ $("#modal-create").addEventListener("click", createSession);
 $("#delete-cancel").addEventListener("click", hideDeleteModal);
 $("#delete-confirm").addEventListener("click", doDelete);
 $("#terminal-reconnect-btn").addEventListener("click", reconnectTerminal);
+$("#chat-toggle-btn").addEventListener("click", () => {
+  if (!state.activeSession) return;
+  chatPanelToggle(state.activeSession, state.activeSessionMeta?.machineHost || "local");
+});
 $("#terminal-kill-btn").addEventListener("click", () => {
   if (state.activeSession) {
     confirmDelete(state.activeSession, state.activeSessionMeta?.machineHost);
   }
+});
+
+// Needs you: tapping an entry opens that session, the same as its tile.
+$("#needs-you").addEventListener("click", (e) => {
+  const item = e.target.closest(".needs-you-item");
+  if (!item) return;
+  openTerminal(item.dataset.name, item.dataset.host);
 });
 
 // Machine filter
