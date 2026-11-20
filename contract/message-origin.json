@@ -1,0 +1,27 @@
+{
+  "note": "Message origin contract. A filed message records where it came from: \"panel\" for a reply typed in the chat panel, \"agent\" for the agent's own reported output, null when nobody said. All My Agents records the origin; it does not decide what it means — a consumer that needs to know whether a message came from James reads the origin. Text typed into a terminal never travels a route that files messages, so it is never tagged at all. The cases are asserted by both suites: web/test/message-origin.test.js and Tests/AllMyAgentsTests/MessageOriginContractTests.swift.",
+  "panelOrigin": "panel",
+  "agentOrigin": "agent",
+  "cases": [
+    {
+      "name": "a reply typed in the panel",
+      "message": {"id": 3, "text": "yes, approved", "at": 1737000000000, "origin": "panel"},
+      "fromPanel": true
+    },
+    {
+      "name": "the agent's own output, reported by the adapter",
+      "message": {"id": 4, "text": "Done — the tests pass.", "at": 1737000001000, "origin": "agent"},
+      "fromPanel": false
+    },
+    {
+      "name": "text the server delivered for a caller that did not say where it came from",
+      "message": {"id": 5, "text": "run the checks", "at": 1737000002000, "origin": null},
+      "fromPanel": false
+    },
+    {
+      "name": "a message from a server that predates the origin tag",
+      "message": {"id": 2, "text": "older message", "at": 1736900000000},
+      "fromPanel": false
+    }
+  ]
+}
