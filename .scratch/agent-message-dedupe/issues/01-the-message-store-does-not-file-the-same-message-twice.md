@@ -1,7 +1,7 @@
 # 1 — The message store does not file the same message twice
 
 Part of: .scratch/agent-message-dedupe/spec.md
-Status: ready-for-agent
+Status: done — branch `issue/01-the-message-store-does-not-file-the-same-message-twice`
 Labels: bug
 
 ## What to build
