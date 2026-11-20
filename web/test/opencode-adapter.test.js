@@ -209,6 +209,46 @@ test("the tracker forgets a session on request", () => {
   assert.equal(tracker.take("ses_1"), null);
 });
 
+test("the tracker reads the reply from a text part on opencode 1.19 and later", () => {
+  // 1.19 and later do not carry the text inside the message: the message
+  // says it is the agent's, and the text arrives as a part of it.
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { id: "msg_1", role: "assistant" },
+    },
+  });
+  tracker.observe({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_1",
+      part: { id: "prt_1", messageID: "msg_1", type: "text", text: "the reply" },
+    },
+  });
+  assert.equal(tracker.take("ses_1"), "the reply");
+});
+
+test("the tracker does not take the person's own text for a reply", () => {
+  const tracker = createReplyTracker();
+  tracker.observe({
+    type: "message.updated",
+    properties: {
+      sessionID: "ses_1",
+      info: { id: "msg_0", role: "user" },
+    },
+  });
+  tracker.observe({
+    type: "message.part.updated",
+    properties: {
+      sessionID: "ses_1",
+      part: { id: "prt_0", messageID: "msg_0", type: "text", text: "the prompt" },
+    },
+  });
+  assert.equal(tracker.take("ses_1"), null);
+});
+
 test("the stop event body carries the reply when there is one", () => {
   assert.deepEqual(buildBody("stop", "ses_1", "abc123", "the reply"), {
     event: "stop",
