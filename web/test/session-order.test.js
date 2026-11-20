@@ -14,11 +14,18 @@ function sess(name, machineHost = "local") {
   return { key: key(machineHost, name), name };
 }
 
+// A session that declares the group it belongs to (ADR 0017: membership is
+// server-declared — the session carries its group).
+function declared(name, group, machineHost = "local") {
+  return { key: key(machineHost, name), name, group };
+}
+
 const data = (over = {}) => ({
   groups: {},
   collapsed: {},
   order: [],
   ungroupedOrder: [],
+  serverGroups: [],
   ...over,
 });
 
@@ -28,6 +35,7 @@ test("createEmptyOrder returns the canonical empty structure", () => {
     collapsed: {},
     order: [],
     ungroupedOrder: [],
+    serverGroups: [],
   });
 });
 
@@ -125,7 +133,7 @@ test("resolveOrder keeps absent keys so returning sessions keep their slot", () 
 
 test("resolveOrder rewrites a stored key when the machine host changes", () => {
   const input = data({ groups: { G: [key("oldhost", "web")] }, order: ["G"] });
-  const out = resolveOrder(input, [sess("web", "newhost")], (s) => s.key);
+  const out = resolveOrder(input, [declared("web", "G", "newhost")], (s) => s.key);
   assert.deepEqual(out.groups[0].sessions.map((s) => s.name), ["web"]);
   assert.deepEqual(out.data.groups.G, [key("newhost", "web")]);
 });
@@ -149,7 +157,8 @@ test("resolveOrder appends group names missing from the order array", () => {
 
 test("resolveOrder seeds a brand-new session at the top of ungrouped", () => {
   const input = data({ groups: { G: ["g1"] }, order: ["G"], ungroupedOrder: ["u1"] });
-  const out = resolveOrder(input, [sess("g1"), sess("u1"), sess("fresh")], (s) => s.key);
+  const out = resolveOrder(input, [declared("g1", "G"), sess("u1"), sess("fresh")], (s) => s.key);
+  assert.deepEqual(out.groups[0].sessions.map((s) => s.name), ["g1"]);
   assert.deepEqual(out.ungrouped.map((s) => s.name), ["fresh", "u1"]);
 });
 
@@ -178,4 +187,102 @@ test("moving an unsafe group is a no-op", () => {
   const after = moveGroup(before, "__proto__", 0);
   assert.deepEqual(after.order, ["Work"]);
   assert.deepEqual(Object.keys(after.groups), ["Work"]);
+});
+
+// --- Membership is server-declared (ADR 0017) ---
+//
+// The store's groups map is the order inside a group, not the membership: a
+// session renders where the server says it belongs, merged with the manual
+// order. A group the store has never seen is adopted for rendering, not
+// claimed — James claims a group by acting on it.
+
+test("a session created in a group appears under that group with no stored membership", () => {
+  const out = resolveOrder(createEmptyOrder(), [declared("alpha", "Task Factory")]);
+  assert.deepEqual(
+    out.groups.map((g) => ({ name: g.name, serverDeclared: g.serverDeclared, members: g.sessions.map((s) => s.name) })),
+    [{ name: "Task Factory", serverDeclared: true, members: ["alpha"] }],
+  );
+  assert.deepEqual(out.ungrouped, []);
+  // Adoption is recorded so the next resolve is stable, but the group is not
+  // claimed: James's own groups live in `order`.
+  assert.deepEqual(out.data.serverGroups, ["Task Factory"]);
+  assert.deepEqual(out.data.order, []);
+  assert.equal(out.changed, true);
+});
+
+test("a new member is appended after the existing members, leaving their order alone", () => {
+  // The previous resolve stored the group's member order; a member that
+  // arrives later appends at the end instead of reshuffling the rest.
+  const input = data({
+    groups: { "Task Factory": [key("local", "one")] },
+    serverGroups: ["Task Factory"],
+  });
+  const out = resolveOrder(input, [declared("two", "Task Factory"), declared("one", "Task Factory")], (s) => s.key);
+  assert.deepEqual(out.groups[0].sessions.map((s) => s.name), ["one", "two"]);
+  assert.deepEqual(out.data.groups["Task Factory"], [key("local", "one"), key("local", "two")]);
+});
+
+test("a session that declares another group moves out of the group it was stored under", () => {
+  const input = data({
+    groups: { A: [key("local", "x")], B: [] },
+    order: ["A", "B"],
+  });
+  const out = resolveOrder(input, [declared("x", "B")]);
+  assert.deepEqual(out.groups[0].sessions, [], "A keeps its header but loses the tile");
+  assert.deepEqual(out.groups[1].sessions.map((s) => s.name), ["x"]);
+  assert.deepEqual(out.data.groups.A, [], "the stale ordering entry is cleaned up");
+});
+
+test("a live session with no declared group is not held by a stored group", () => {
+  // Membership used to be client-owned; the server never declared it, so a
+  // session stored in a group but declaring none belongs in the ungrouped
+  // region — it must not become invisible.
+  const input = data({ groups: { A: [key("local", "x")] }, order: ["A"] });
+  const out = resolveOrder(input, [sess("x")]);
+  assert.deepEqual(out.groups[0].sessions, []);
+  assert.deepEqual(out.ungrouped.map((s) => s.name), ["x"]);
+  assert.deepEqual(out.data.groups.A, []);
+  assert.deepEqual(out.data.ungroupedOrder, [key("local", "x")]);
+});
+
+test("a server-declared group James claims by acting on is no longer server-declared", () => {
+  const claimed = moveSession(createEmptyOrder(), key("local", "alpha"), "Task Factory", 0);
+  assert.deepEqual(claimed.order, ["Task Factory"]);
+  assert.deepEqual(claimed.serverGroups, [], "claiming removes the adoption record");
+  const out = resolveOrder(claimed, [declared("alpha", "Task Factory")]);
+  assert.equal(out.groups[0].serverDeclared, false);
+});
+
+test("moveGroup claims a server-declared group too", () => {
+  const input = data({ groups: { "Task Factory": [] }, serverGroups: ["Task Factory"] });
+  const out = moveGroup(input, "Task Factory", 0);
+  assert.deepEqual(out.order, ["Task Factory"]);
+  assert.deepEqual(out.serverGroups, []);
+});
+
+test("a server-declared group whose members are all gone is dropped, without residue", () => {
+  const seeded = resolveOrder(createEmptyOrder(), [declared("alpha", "Task Factory")]);
+  const out = resolveOrder(seeded.data, []);
+  assert.deepEqual(out.data.serverGroups, [], "the adoption record goes with the members");
+  assert.deepEqual(Object.keys(out.data.groups), [], "no ordering residue is left behind");
+  assert.deepEqual(out.groups, [], "the group is not rendered without members");
+});
+
+test("a user group survives as an empty header even when no session declares it", () => {
+  const input = data({ groups: { G: [], Lost: [] }, order: ["G"] });
+  const out = resolveOrder(input, [], (s) => s.key);
+  assert.deepEqual(out.groups.map((g) => g.name), ["G", "Lost"]);
+});
+
+test("an unsafe declared group name is treated as no group", () => {
+  const out = resolveOrder(createEmptyOrder(), [{ key: key("local", "x"), name: "x", group: "__proto__" }]);
+  assert.deepEqual(out.groups, []);
+  assert.deepEqual(out.ungrouped.map((s) => s.name), ["x"]);
+});
+
+test("resolution does not mutate its input, including serverGroups", () => {
+  const input = { ...createEmptyOrder(), groups: { A: [key("local", "x")] }, order: ["A"] };
+  const snapshot = JSON.parse(JSON.stringify(input));
+  resolveOrder(input, [declared("x", "B")]);
+  assert.deepEqual(input, snapshot);
 });

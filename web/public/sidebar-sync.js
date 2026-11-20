@@ -61,6 +61,18 @@ export function sanitizeSidebarOrder(data) {
     ungroupedOrder: Array.isArray(src.ungroupedOrder)
       ? src.ungroupedOrder.filter((k) => typeof k === "string")
       : [],
+    // Group names this surface adopted from the sessions' server-declared
+    // membership (ADR 0017) rather than created by hand. A name James has
+    // claimed lives in `order`, so an adopted name that also appears there is
+    // not an adoption any more.
+    serverGroups: [...new Set(
+      Array.isArray(src.serverGroups)
+        ? src.serverGroups.filter(
+            (n) => typeof n === "string" && isSafeGroupName(n) &&
+              !(Array.isArray(src.order) && src.order.includes(n)),
+          )
+        : [],
+    )],
   };
   return order;
 }
