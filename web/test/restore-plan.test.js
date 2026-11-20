@@ -196,3 +196,21 @@ test("a launch spec takes precedence over a resumable agent", () => {
     { kind: "relaunch-command", name: "win", dir: "/repos/a", group: null, launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
   ]);
 });
+
+// Membership is server-declared (ADR 0017): the group the registry recorded
+// comes back with the session, whatever kind of restore it is.
+test("a restored entry carries the group the registry recorded", () => {
+  const registry = {
+    version: 2,
+    updatedAt: "2026-09-01T12:00:00.000Z",
+    sessions: [
+      { tmux: "task-slice", dir: "/repos/task-factory", group: "Task Factory", sessionId: null, agent: "shell", firstSeen: "x", lastActive: "x" },
+      { tmux: "win", dir: "/repos/a", group: "Work", sessionId: null, agent: "shell", launch: { kind: "target", name: "windows-vm" }, firstSeen: "x", lastActive: "x" },
+    ],
+  };
+  const actions = buildRestorePlan({ registry, existingTmux: [], resolvable: new Set() });
+  assert.deepEqual(actions, [
+    { kind: "recreate-shell", name: "task-slice", dir: "/repos/task-factory", agent: "shell", group: "Task Factory", reason: "recreate-shell" },
+    { kind: "relaunch-command", name: "win", dir: "/repos/a", group: "Work", launch: { kind: "target", name: "windows-vm" }, reason: "relaunch" },
+  ]);
+});
