@@ -79,3 +79,14 @@ test("a wait whose start is unknown sorts first", () => {
     ["untimed", "timed"],
   );
 });
+
+// How the list tells James how long a session has waited.
+import { waitedFor } from "../public/needs-you.js";
+
+test("a wait reads as seconds under a minute, minutes under an hour, hours beyond", () => {
+  const now = 10_000_000;
+  assert.equal(waitedFor({ lastActivity: now - 45_000 }, now), "45s");
+  assert.equal(waitedFor({ lastActivity: now - 3 * 60_000 }, now), "3m");
+  assert.equal(waitedFor({ lastActivity: now - 2 * 3_600_000 }, now), "2h");
+  assert.equal(waitedFor({ lastActivity: 0 }, now), "?", "a wait nobody can time reads honestly");
+});
