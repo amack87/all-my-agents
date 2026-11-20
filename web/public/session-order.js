@@ -5,15 +5,22 @@
 // the persisted group-data structure:
 //
 //   { groups: { name: [key, ...] }, collapsed: { name: bool },
-//     order: [groupName, ...], ungroupedOrder: [key, ...] }
+//     order: [groupName, ...], ungroupedOrder: [key, ...],
+//     serverGroups: [groupName, ...] }
 //
-// Manual order wins: nothing here reads a session's status, so tiles never move
-// themselves. See ../CONTEXT.md and ../docs/adr/0001-manual-sidebar-order.md.
+// Membership is server-declared (ADR 0017, which amends ADR 0006): a session
+// carries the `group` it belongs to and renders there, wherever this surface's
+// store says it used to sit. What the store keeps is the user's — the group
+// list (`order`), the order inside a group (`groups`), the collapsed flags and
+// the ungrouped order — plus `serverGroups`, the record of group names adopted
+// from session declarations rather than created by James. Manual order wins:
+// nothing here reads a session's status, so tiles never move themselves. See
+// ../CONTEXT.md and ../docs/adr/0001-manual-sidebar-order.md.
 
 import { isSafeGroupName } from "./sidebar-sync.js";
 
 export function createEmptyOrder() {
-  return { groups: {}, collapsed: {}, order: [], ungroupedOrder: [] };
+  return { groups: {}, collapsed: {}, order: [], ungroupedOrder: [], serverGroups: [] };
 }
 
 function normalize(data) {
@@ -38,7 +45,13 @@ function normalize(data) {
   const ungroupedOrder = Array.isArray(src.ungroupedOrder)
     ? src.ungroupedOrder.filter((k) => typeof k === "string")
     : [];
-  const next = { groups, collapsed, order, ungroupedOrder };
+  // A server-declared group that James has claimed lives in `order`, so an
+  // adopted name that also appears there is not an adoption any more.
+  const claimed = new Set(order);
+  const serverGroups = Array.isArray(src.serverGroups)
+    ? [...new Set(src.serverGroups.filter((n) => typeof n === "string" && isSafeGroupName(n) && !claimed.has(n)))]
+    : [];
+  const next = { groups, collapsed, order, ungroupedOrder, serverGroups };
   return next;
 }
 
@@ -70,10 +83,11 @@ export function moveSession(data, key, target, index) {
     const at = clamp(index, next.ungroupedOrder.length);
     next.ungroupedOrder.splice(at, 0, key);
   } else {
-    if (!next.groups[groupTarget]) {
-      next.groups[groupTarget] = [];
-      if (!next.order.includes(groupTarget)) next.order.push(groupTarget);
-    }
+    if (!next.groups[groupTarget]) next.groups[groupTarget] = [];
+    // Acting on a group claims it: it moves out of the adoption record into
+    // James's own group list, so the sidebar stops marking it server-declared.
+    next.serverGroups = next.serverGroups.filter((n) => n !== groupTarget);
+    if (!next.order.includes(groupTarget)) next.order.push(groupTarget);
     const at = clamp(index, next.groups[groupTarget].length);
     next.groups[groupTarget].splice(at, 0, key);
   }
@@ -84,6 +98,8 @@ export function moveSession(data, key, target, index) {
 export function moveGroup(data, name, index) {
   const next = normalize(data);
   if (!isSafeGroupName(name)) return next;
+  // Reordering a group claims it, the same way acting on a session does.
+  next.serverGroups = next.serverGroups.filter((n) => n !== name);
   next.order = next.order.filter((n) => n !== name);
   for (const groupName of Object.keys(next.groups)) {
     if (groupName !== name && !next.order.includes(groupName)) next.order.push(groupName);
@@ -94,17 +110,27 @@ export function moveGroup(data, name, index) {
 }
 
 /**
- * Reconcile stored keys against the live sessions and resolve the render view.
+ * Reconcile stored keys against the live sessions and resolve the render view,
+ * merging the sessions' server-declared membership with the manual order.
  *
  * - stored keys whose session is absent are kept (so a returning session gets
  *   its old slot back)
  * - a stored key whose session reappears under a different machine host is
  *   rewritten to the new key, keeping its slot
- * - sessions never seen before are seeded at the top of the ungrouped region
- * - group names missing from `order` are appended
+ * - a session's declared group is where it renders: a member arriving joins
+ *   the END of its group's order, so the members already there never shuffle
+ * - a declared group the store has never seen is adopted into `serverGroups`
+ *   and rendered after James's own groups, marked server-declared
+ * - a live session that declares no group is re-homed to the ungrouped region
+ *   (membership used to be client-owned; the server is the authority now)
+ * - a server-declared group whose members are all gone loses its adoption —
+ *   membership lives on the sessions, so it disappears with them
+ * - group names stored before this resolve and missing from `order` are
+ *   appended (James's own groups never silently vanish)
  *
  * Returns { data, groups, ungrouped, changed } where `groups` is
- * [{ name, collapsed, sessions }] in render order (empty groups included).
+ * [{ name, collapsed, serverDeclared, sessions }] in render order (empty
+ * user groups included).
  */
 export function resolveOrder(data, sessions, keyOf = (s) => s.key) {
   const next = normalize(data);
@@ -134,8 +160,9 @@ export function resolveOrder(data, sessions, keyOf = (s) => s.key) {
   const seen = new Set();
 
   for (const name of Object.keys(next.groups)) {
+    const stored = next.groups[name];
     const resolved = [];
-    for (const k of next.groups[name]) {
+    for (const k of stored) {
       const rk = reconcileKey(k);
       if (seen.has(rk)) {
         changed = true;
@@ -144,7 +171,7 @@ export function resolveOrder(data, sessions, keyOf = (s) => s.key) {
       seen.add(rk);
       resolved.push(rk);
     }
-    if (resolved.length !== next.groups[name].length) changed = true;
+    if (resolved.length !== stored.length) changed = true;
     next.groups[name] = resolved;
   }
 
@@ -161,33 +188,108 @@ export function resolveOrder(data, sessions, keyOf = (s) => s.key) {
   if (ungroupedResolved.length !== next.ungroupedOrder.length) changed = true;
   next.ungroupedOrder = ungroupedResolved;
 
-  const fresh = [];
+  // Membership merge. The stored keys were reconciled first, so this pass
+  // re-homes live sessions by what the server declares, not by what a stale
+  // copy of the store says.
+  const declaredOf = (session) =>
+    session && isSafeGroupName(session.group) ? session.group : null;
+  const storedGroupNames = new Set(Object.keys(next.groups));
+  const storedUngrouped = new Set(next.ungroupedOrder);
+  const freshUngrouped = [];
+
   for (const session of list) {
     const k = keyOf(session);
-    if (!seen.has(k)) {
-      seen.add(k);
-      fresh.push(k);
+    const declared = declaredOf(session);
+    if (declared == null) {
+      // No declaration: the tile belongs in the ungrouped region. It must not
+      // be held by a group the store remembers from a client-owned past.
+      for (const name of Object.keys(next.groups)) {
+        if (!next.groups[name].includes(k)) continue;
+        next.groups[name] = next.groups[name].filter((key) => key !== k);
+        changed = true;
+      }
+      if (!storedUngrouped.has(k)) freshUngrouped.push(k);
+      continue;
+    }
+    // Adopt a group name no copy of the store has arranged yet.
+    if (!next.order.includes(declared) && !next.serverGroups.includes(declared)) {
+      next.serverGroups = [...next.serverGroups, declared];
+      changed = true;
+    }
+    if (!next.groups[declared]) next.groups[declared] = [];
+    // The session leaves every group it does not declare.
+    for (const name of Object.keys(next.groups)) {
+      if (name === declared || !next.groups[name].includes(k)) continue;
+      next.groups[name] = next.groups[name].filter((key) => key !== k);
+      changed = true;
+    }
+    // A member arriving appends after the existing members: their order —
+    // James's — is left alone.
+    if (!next.groups[declared].includes(k)) {
+      next.groups[declared] = [...next.groups[declared], k];
+      changed = true;
     }
   }
-  if (fresh.length) {
-    next.ungroupedOrder = [...fresh, ...next.ungroupedOrder];
+
+  // Sessions whose declared home is the ungrouped region and that have no
+  // stored ungrouped slot seed at the top, in session-list order.
+  if (freshUngrouped.length) {
+    next.ungroupedOrder = [...freshUngrouped, ...next.ungroupedOrder];
     changed = true;
   }
 
+  // Group names the store already arranged but that `order` lost are still
+  // James's own: they rejoin the group list. Names adopted this resolve are
+  // not claimed by it.
   for (const groupName of Object.keys(next.groups)) {
-    if (!next.order.includes(groupName)) {
+    if (storedGroupNames.has(groupName) || next.order.includes(groupName)) continue;
+    if (next.serverGroups.includes(groupName)) continue;
+    next.order.push(groupName);
+    changed = true;
+  }
+  for (const groupName of storedGroupNames) {
+    if (!next.order.includes(groupName) && !next.serverGroups.includes(groupName)) {
       next.order.push(groupName);
       changed = true;
     }
   }
 
-  const groups = next.order.map((name) => ({
-    name,
-    collapsed: !!next.collapsed[name],
-    sessions: (next.groups[name] || []).map((k) => keyToSession.get(k)).filter(Boolean),
-  }));
+  // Membership lives on the sessions (ADR 0017): a server-declared group whose
+  // members have all gone loses its adoption and leaves no ordering residue.
+  next.serverGroups = next.serverGroups.filter((name) => {
+    if (list.some((session) => declaredOf(session) === name)) return true;
+    delete next.groups[name];
+    changed = true;
+    return false;
+  });
 
-  const ungrouped = next.ungroupedOrder.map((k) => keyToSession.get(k)).filter(Boolean);
+  const groupSessions = (name) =>
+    (next.groups[name] || [])
+      .map((k) => keyToSession.get(k))
+      .filter((session) => session && declaredOf(session) === name);
+
+  // Render James's groups in his order, then the adopted (server-declared)
+  // ones in adoption order.
+  const groups = [
+    ...next.order.map((name) => ({
+      name,
+      collapsed: !!next.collapsed[name],
+      serverDeclared: false,
+      sessions: groupSessions(name),
+    })),
+    ...next.serverGroups
+      .filter((name) => !next.order.includes(name))
+      .map((name) => ({
+        name,
+        collapsed: !!next.collapsed[name],
+        serverDeclared: true,
+        sessions: groupSessions(name),
+      })),
+  ];
+
+  const ungrouped = next.ungroupedOrder
+    .map((k) => keyToSession.get(k))
+    .filter((session) => session && declaredOf(session) == null);
 
   return { data: next, groups, ungrouped, changed };
 }

@@ -81,7 +81,7 @@ launchctl stop com.allmyagents-web && launchctl start com.allmyagents-web
 
 ## Sidebar groups & sync
 
-- **Group definitions are protected**: a copy with **no** groups can never erase a copy that **has** them. The user declares the erasure with `groupsCleared: true`, set only when they delete their last group. Both the client and the server resolve with `pickWinner` in `public/sidebar-sync.js`, so they cannot disagree. See `../docs/adr/0006-groups-are-protected.md`.
+- **Group definitions are protected**: a copy with **no** groups can never erase a copy that **has** them. Membership itself is server-declared now (ADR 0017 — a session carries its `group`), so what this rule protects is the group list and its order; the `groupsCleared` erasure flag is gone with the client-owned membership it described. Both the client and the server resolve with `pickWinner` in `public/sidebar-sync.js`, so they cannot disagree. See `../docs/adr/0006-groups-are-protected.md`.
 - **Sync before render**: `init()` awaits `syncGroups()` **before** `loadSessions()`. The reverse order lets a blank local copy win the race and wipe the server's groups.
 - **The reset button is not app state**: `#reset-btn` clears the host list, zoom and sidebar width — never the group keys — and asks for confirmation first.
 - **Session key format**: `<machineHost>::<name>` — host first (`local::slice`). Defined once, in `public/app.js`'s `sessionKey()`.

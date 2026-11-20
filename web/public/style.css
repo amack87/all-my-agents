@@ -274,6 +274,17 @@ html, body {
   min-width: 0;
 }
 
+/* The group a session belongs to, shown on the tile (ADR 0017). */
+.session-group-badge {
+  font-size: 10px;
+  opacity: 0.65;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 .session-project::before {
   content: "\00b7\00a0";
 }
@@ -375,6 +386,20 @@ html, body {
   font-size: 11px;
   opacity: 0.5;
   font-weight: 400;
+}
+
+/* A group that exists because the server declared its members (ADR 0017),
+   not because James arranged it. The tag tells him whose tile-home it is. */
+.group-server-tag {
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.55;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  flex-shrink: 0;
 }
 
 .session-group-body {

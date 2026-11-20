@@ -5,10 +5,17 @@ import Foundation
 // one persisted format and identical semantics:
 //
 //   { groups: { name: [key, ...] }, collapsed: { name: bool },
-//     order: [groupName, ...], ungroupedOrder: [key, ...] }
+//     order: [groupName, ...], ungroupedOrder: [key, ...],
+//     serverGroups: [groupName, ...] }
 //
-// Manual order wins: nothing here reads a session's status, so tiles never
-// move themselves (see the web repo's docs/adr/0001-manual-sidebar-order.md).
+// Membership is server-declared (ADR 0017, which amends ADR 0006): a session
+// carries the `group` it belongs to and renders there, wherever this surface's
+// store says it used to sit. What the store keeps is the user's — the group
+// list (`order`), the order inside a group (`groups`), the collapsed flags and
+// the ungrouped order — plus `serverGroups`, the record of group names adopted
+// from session declarations rather than created by James. Manual order wins:
+// nothing here reads a session's status, so tiles never move themselves (see
+// the web repo's docs/adr/0001-manual-sidebar-order.md).
 
 /// Persisted sidebar order structure — exactly the web app's JSON shape.
 struct SidebarOrderData: Codable, Equatable {
@@ -16,9 +23,41 @@ struct SidebarOrderData: Codable, Equatable {
     var collapsed: [String: Bool]
     var order: [String]
     var ungroupedOrder: [String]
+    /// Group names adopted from the sessions' server-declared membership
+    /// rather than claimed by James (ADR 0017). A name in `order` is his.
+    var serverGroups: [String]
+
+    init(
+        groups: [String: [String]] = [:],
+        collapsed: [String: Bool] = [:],
+        order: [String] = [],
+        ungroupedOrder: [String] = [],
+        serverGroups: [String] = []
+    ) {
+        self.groups = groups
+        self.collapsed = collapsed
+        self.order = order
+        self.ungroupedOrder = ungroupedOrder
+        self.serverGroups = serverGroups
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case groups, collapsed, order, ungroupedOrder, serverGroups
+    }
+
+    /// Older copies of the store predate `serverGroups`; a stored copy is
+    /// decoded the same way regardless of which surface wrote it.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        groups = try container.decodeIfPresent([String: [String]].self, forKey: .groups) ?? [:]
+        collapsed = try container.decodeIfPresent([String: Bool].self, forKey: .collapsed) ?? [:]
+        order = try container.decodeIfPresent([String].self, forKey: .order) ?? []
+        ungroupedOrder = try container.decodeIfPresent([String].self, forKey: .ungroupedOrder) ?? []
+        serverGroups = try container.decodeIfPresent([String].self, forKey: .serverGroups) ?? []
+    }
 
     static func empty() -> SidebarOrderData {
-        SidebarOrderData(groups: [:], collapsed: [:], order: [], ungroupedOrder: [])
+        SidebarOrderData()
     }
 }
 
@@ -34,6 +73,9 @@ struct SidebarOrderEntry: Codable, Equatable {
 struct ResolvedSidebarGroup: Identifiable, Equatable {
     let name: String
     let isCollapsed: Bool
+    /// True when the group exists because sessions declare it (adopted from
+    /// the server) rather than because James arranged it.
+    let isServerDeclared: Bool
     let sessions: [ClaudeSession]
     var id: String { name }
 }
@@ -81,13 +123,21 @@ enum SidebarOrder {
             // A group name that collides with Object.prototype cannot be stored
             // as a plain object key, so it is dropped on the way in — the same
             // normalising the web app's sanitizeSidebarOrder does.
+            // A group James has claimed lives in `order`, so an adopted name
+            // that also appears there is not an adoption any more.
+            let claimed = Set((obj["order"] as? [String] ?? []).filter { isSafeGroupName($0) })
             return SidebarOrderData(
                 groups: (obj["groups"] as? [String: [String]] ?? [:])
                     .filter { isSafeGroupName($0.key) },
                 collapsed: (obj["collapsed"] as? [String: Bool] ?? [:])
                     .filter { isSafeGroupName($0.key) },
                 order: (obj["order"] as? [String] ?? []).filter { isSafeGroupName($0) },
-                ungroupedOrder: obj["ungroupedOrder"] as? [String] ?? []
+                ungroupedOrder: obj["ungroupedOrder"] as? [String] ?? [],
+                serverGroups: Array(Set(
+                    (obj["serverGroups"] as? [String] ?? []).filter {
+                        isSafeGroupName($0) && !claimed.contains($0)
+                    }
+                ))
             )
         }
 
@@ -229,8 +279,12 @@ enum SidebarOrder {
             }
             if next.groups[target] == nil {
                 next.groups[target] = []
-                if !next.order.contains(target) { next.order.append(target) }
             }
+            // Acting on a group claims it: it moves out of the adoption record
+            // into James's own group list, so the sidebar stops marking it
+            // server-declared.
+            next.serverGroups.removeAll { $0 == target }
+            if !next.order.contains(target) { next.order.append(target) }
             let members = next.groups[target] ?? []
             var updated = members
             updated.insert(key, at: clamp(index, count: members.count))
@@ -254,6 +308,8 @@ enum SidebarOrder {
     /// Reorder a group among its peers (post-removal insertion position).
     static func moveGroup(_ data: SidebarOrderData, name: String, index: Int) -> SidebarOrderData {
         var next = data
+        // Reordering a group claims it, the same way acting on a session does.
+        next.serverGroups.removeAll { $0 == name }
         next.order = next.order.filter { $0 != name }
         for groupName in next.groups.keys.sorted()
         where groupName != name && !next.order.contains(groupName) {
@@ -265,13 +321,25 @@ enum SidebarOrder {
 
     // MARK: - Resolution
 
-    /// Reconcile stored keys against the live sessions and build the render view.
+    /// Reconcile stored keys against the live sessions and build the render view,
+    /// merging the sessions' server-declared membership with the manual order.
     ///
     /// - stored keys whose session is absent are kept (slot reserved)
     /// - a stored key whose session reappears under a different machine host
     ///   is rewritten to the new key, keeping its slot
-    /// - sessions never seen before are seeded at the top of the ungrouped region
-    /// - group names missing from `order` are appended
+    /// - a session's declared group is where it renders: a member arriving
+    ///   joins the END of its group's order, so the members already there
+    ///   never shuffle
+    /// - a declared group the store has never seen is adopted into
+    ///   `serverGroups` and rendered after James's own groups
+    /// - a live session that declares no group is re-homed to the ungrouped
+    ///   region (membership used to be client-owned; the server is the
+    ///   authority now)
+    /// - a server-declared group whose members are all gone loses its
+    ///   adoption — membership lives on the sessions, so it disappears with
+    ///   them
+    /// - group names stored before this resolve and missing from `order` are
+    ///   appended (James's own groups never silently vanish)
     static func resolve(data: SidebarOrderData, sessions: [ClaudeSession]) -> SidebarResolution {
         var next = data
 
@@ -294,6 +362,11 @@ enum SidebarOrder {
             let newKey = match.sidebarKey
             if newKey != storedKey { changed = true }
             return newKey
+        }
+
+        func declaredGroup(_ session: ClaudeSession) -> String? {
+            guard let group = session.group, isSafeGroupName(group) else { return nil }
+            return group
         }
 
         var seen = Set<String>()
@@ -327,31 +400,113 @@ enum SidebarOrder {
         if ungroupedResolved.count != next.ungroupedOrder.count { changed = true }
         next.ungroupedOrder = ungroupedResolved
 
-        var fresh: [String] = []
-        for session in sessions where !seen.contains(session.sidebarKey) {
-            seen.insert(session.sidebarKey)
-            fresh.append(session.sidebarKey)
+        // Membership merge. The stored keys were reconciled first, so this pass
+        // re-homes live sessions by what the server declares, not by what a
+        // stale copy of the store says.
+        let storedGroupNames = Set(next.groups.keys)
+        let storedUngrouped = Set(next.ungroupedOrder)
+        var freshUngrouped: [String] = []
+
+        for session in sessions {
+            let k = session.sidebarKey
+            if let declared = declaredGroup(session) {
+                // Adopt a group name no copy of the store has arranged yet.
+                if !next.order.contains(declared) && !next.serverGroups.contains(declared) {
+                    next.serverGroups.append(declared)
+                    changed = true
+                }
+                if next.groups[declared] == nil { next.groups[declared] = [] }
+                // The session leaves every group it does not declare.
+                for name in Array(next.groups.keys) where name != declared {
+                    if let idx = next.groups[name]?.firstIndex(of: k) {
+                        next.groups[name]?.remove(at: idx)
+                        changed = true
+                    }
+                }
+                // A member arriving appends after the existing members: their
+                // order — James's — is left alone.
+                if next.groups[declared]?.contains(k) != true {
+                    next.groups[declared]?.append(k)
+                    changed = true
+                }
+            } else {
+                // No declaration: the tile belongs in the ungrouped region. It
+                // must not be held by a group the store remembers from a
+                // client-owned past.
+                for name in Array(next.groups.keys) {
+                    if let idx = next.groups[name]?.firstIndex(of: k) {
+                        next.groups[name]?.remove(at: idx)
+                        changed = true
+                    }
+                }
+                if !storedUngrouped.contains(k) && !freshUngrouped.contains(k) {
+                    freshUngrouped.append(k)
+                }
+            }
         }
-        if !fresh.isEmpty {
-            next.ungroupedOrder = fresh + next.ungroupedOrder
+
+        // Sessions whose declared home is the ungrouped region and that have no
+        // stored ungrouped slot seed at the top, in session-list order.
+        if !freshUngrouped.isEmpty {
+            next.ungroupedOrder = freshUngrouped + next.ungroupedOrder
             changed = true
         }
 
-        for groupName in Array(next.groups.keys) where !next.order.contains(groupName) {
+        // Group names the store already arranged but that `order` lost are
+        // still James's own: they rejoin the group list. Names adopted this
+        // resolve are not claimed by it.
+        for groupName in next.groups.keys.sorted() {
+            if storedGroupNames.contains(groupName) || next.order.contains(groupName) {
+                continue
+            }
+            if next.serverGroups.contains(groupName) { continue }
             next.order.append(groupName)
             changed = true
         }
-
-        // Render groups in persisted order; empty groups still render
-        // ("groups[name] ?? []") so their headers stay droppable.
-        let groups = next.order.map { name in
-            ResolvedSidebarGroup(
-                name: name,
-                isCollapsed: next.collapsed[name] ?? false,
-                sessions: (next.groups[name] ?? []).compactMap { keyToSession[$0] }
-            )
+        for groupName in storedGroupNames.sorted() {
+            if !next.order.contains(groupName) && !next.serverGroups.contains(groupName) {
+                next.order.append(groupName)
+                changed = true
+            }
         }
+
+        // Membership lives on the sessions (ADR 0017): a server-declared group
+        // whose members have all gone loses its adoption and leaves no
+        // ordering residue.
+        next.serverGroups = next.serverGroups.filter { name in
+            if sessions.contains(where: { declaredGroup($0) == name }) { return true }
+            next.groups[name] = nil
+            changed = true
+            return false
+        }
+
+        // Render James's groups in his order, then the adopted
+        // (server-declared) ones in adoption order.
+        func groupSessions(_ name: String) -> [ClaudeSession] {
+            (next.groups[name] ?? []).compactMap { keyToSession[$0] }
+                .filter { declaredGroup($0) == name }
+        }
+        let groups =
+            next.order.map { name in
+                ResolvedSidebarGroup(
+                    name: name,
+                    isCollapsed: next.collapsed[name] ?? false,
+                    isServerDeclared: false,
+                    sessions: groupSessions(name)
+                )
+            }
+            + next.serverGroups
+                .filter { !next.order.contains($0) }
+                .map { name in
+                    ResolvedSidebarGroup(
+                        name: name,
+                        isCollapsed: next.collapsed[name] ?? false,
+                        isServerDeclared: true,
+                        sessions: groupSessions(name)
+                    )
+                }
         let ungrouped = next.ungroupedOrder.compactMap { keyToSession[$0] }
+            .filter { declaredGroup($0) == nil }
 
         return SidebarResolution(data: next, groups: groups, ungrouped: ungrouped, changed: changed)
     }

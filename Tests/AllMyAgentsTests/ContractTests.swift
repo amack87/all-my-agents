@@ -131,3 +131,95 @@ private struct SessionFieldsContract: Decodable {
         )
     }
 }
+
+// MARK: - The membership merge
+
+/// The membership fixture, read from `contract/sidebar-membership.json`.
+/// Each case is a sidebar-order store plus a session list; this app's
+/// `SidebarOrder.resolve` and the web app's `resolveOrder` must produce the
+/// same groups, in the same order, with the same members.
+private struct MembershipContract: Decodable {
+    struct Case: Decodable {
+        struct FixtureSession: Decodable {
+            let key: String
+            let name: String
+            let group: String?
+        }
+
+        struct Expected: Decodable {
+            struct Group: Decodable, Equatable {
+                let name: String
+                let serverDeclared: Bool
+                let members: [String]
+            }
+
+            let groups: [Group]
+            let ungrouped: [String]
+        }
+
+        let name: String
+        let data: SidebarOrderData
+        let sessions: [FixtureSession]
+        let expected: Expected
+    }
+
+    let cases: [Case]
+}
+
+@Test func membershipFixtureIsPresent() throws {
+    let url = ContractFixture.repoRoot.appendingPathComponent("contract/sidebar-membership.json")
+    #expect(FileManager.default.fileExists(atPath: url.path))
+}
+
+@Test func membershipContractResolvesIdenticallyToTheWebApp() throws {
+    let url = ContractFixture.repoRoot.appendingPathComponent("contract/sidebar-membership.json")
+    let data = try Data(contentsOf: url)
+    let contract = try JSONDecoder().decode(MembershipContract.self, from: data)
+    #expect(!contract.cases.isEmpty)
+
+    for testCase in contract.cases {
+        let sessions = testCase.sessions.map { fixture in
+            // The fixture key is `host::name`; rebuilding the session from its
+            // parts must reproduce exactly that key.
+            let host = String(fixture.key.prefix(while: { $0 != ":" }))
+            return ClaudeSession(
+                id: fixture.key,
+                pid: 0,
+                tty: "",
+                sessionUUID: nil,
+                tmuxPane: nil,
+                tmuxSession: fixture.name,
+                projectPath: nil,
+                summary: nil,
+                agent: "shell",
+                status: .idle,
+                lastSeen: Date(),
+                lastActivity: nil,
+                machine: host == "local" ? nil : host,
+                machineHost: host,
+                task: nil,
+                group: fixture.group,
+                dir: nil
+            )
+        }
+        let out = SidebarOrder.resolve(data: testCase.data, sessions: sessions)
+        let observed = MembershipContract.Case.Expected(
+            groups: out.groups.map { group in
+                .init(
+                    name: group.name,
+                    serverDeclared: group.isServerDeclared,
+                    members: group.sessions.map(\.sidebarName)
+                )
+            },
+            ungrouped: out.ungrouped.map(\.sidebarName)
+        )
+        #expect(
+            observed.groups == testCase.expected.groups,
+            "contract case \"\(testCase.name)\": groups disagreed\n got \(observed.groups)\n expected \(testCase.expected.groups)"
+        )
+        #expect(
+            observed.ungrouped == testCase.expected.ungrouped,
+            "contract case \"\(testCase.name)\": ungrouped disagreed"
+        )
+    }
+}

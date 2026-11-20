@@ -9,7 +9,7 @@
 // stub, so these tests run without a live tmux pane.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -148,4 +148,61 @@ test("a peer session maps the group and directory it reports", async () => {
   const { sessions } = await fetchAllMeshSessions(local, { name: "workhorse", peers: [] });
   assert.equal(sessions[0].group, null);
   assert.equal(sessions[0].dir, null);
+});
+
+// --- Declaring membership after creation (ADR 0017) ---
+//
+// Dragging a tile into or out of a group is a server write: the client asks
+// the server to change that session's group, because membership is the
+// server's to declare.
+
+test("declaring a group for an existing session is a server write", async () => {
+  const { statusCode, payload } = await call("POST", "/api/sessions/moved-slice/group", {
+    group: "Task Factory",
+  });
+  assert.equal(statusCode, 200);
+  assert.equal(payload.ok, true);
+  assert.equal(sessionGroups.get("moved-slice"), "Task Factory");
+});
+
+test("declaring null takes a session out of its group", async () => {
+  sessionGroups.set("cleared-slice", "Work");
+  const { statusCode, payload } = await call("POST", "/api/sessions/cleared-slice/group", {
+    group: null,
+  });
+  assert.equal(statusCode, 200);
+  assert.equal(payload.ok, true);
+  assert.equal(payload.group, null);
+  assert.equal(sessionGroups.has("cleared-slice"), false);
+});
+
+test("an unsafe group name is refused", async () => {
+  const { statusCode, payload } = await call("POST", "/api/sessions/moved-slice/group", {
+    group: "__proto__",
+  });
+  assert.equal(statusCode, 400);
+  assert.match(payload.error, /group/i);
+});
+
+test("an invalid session name is refused", async () => {
+  const { statusCode } = await call("POST", "/api/sessions/bad name!/group", { group: "Work" });
+  assert.equal(statusCode, 400);
+});
+
+test("a declared group reaches the active-session registry before the next poll", async () => {
+  // Registry persistence is what carries the declaration across a restart:
+  // reconcile only runs on the poll cycle, so the write path updates the
+  // entry it already has.
+  await call("POST", "/api/sessions/registry-slice/group", { group: "Refiled" });
+  assert.equal(sessionGroups.get("registry-slice"), "Refiled");
+  const registry = JSON.parse(readFileSync(join(logDir, "active-sessions.json"), "utf8"));
+  const entry = registry.sessions.find((s) => s.tmux === "registry-slice");
+  assert.equal(entry.group, "Refiled");
+});
+
+test("declaring a group for a session with no registry entry still publishes it", async () => {
+  await call("POST", "/api/sessions/unmanaged-slice/group", { group: "Work" });
+  assert.equal(sessionGroups.get("unmanaged-slice"), "Work");
+  const registry = JSON.parse(readFileSync(join(logDir, "active-sessions.json"), "utf8"));
+  assert.equal(registry.sessions.find((s) => s.tmux === "unmanaged-slice"), undefined);
 });

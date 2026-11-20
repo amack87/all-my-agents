@@ -6,6 +6,7 @@ import { Unicode11Addon } from "https://cdn.jsdelivr.net/npm/@xterm/addon-unicod
 
 // --- Sidebar ordering (pure, DOM-free) ---
 import { moveSession, moveGroup, resolveOrder } from "./session-order.js";
+import { groupOf, groupBadgeHtml, serverGroupTagHtml } from "./session-membership.js";
 import { pickWinner, isSafeGroupName, sanitizeSidebarOrder } from "./sidebar-sync.js";
 import { resizeFrame, claimFrame, CLAIM_HEARTBEAT_MS, shouldHeartbeat, isTouched } from "./terminal-size.js";
 import { esc } from "./escape.js";
@@ -303,9 +304,10 @@ function createGroup(name) {
   if (!data.groups[name]) {
     data.groups[name] = [];
     data.order = [...data.order.filter((n) => n !== name), name];
+    // Creating the group is James acting on it: it leaves the adoption
+    // record and becomes one of his own (ADR 0017).
+    data.serverGroups = (data.serverGroups || []).filter((n) => n !== name);
   }
-  // The user has groups again, so any earlier "I cleared them" no longer holds.
-  delete data.groupsCleared;
   saveGroups(data);
 }
 
@@ -314,10 +316,9 @@ function deleteGroup(name) {
   delete data.groups[name];
   delete data.collapsed[name];
   data.order = data.order.filter((n) => n !== name);
-  // Deleting the last group is the only way the user can mean "no groups".
-  // The flag lets that intent survive the sync instead of being undone by a
-  // copy that still holds the old group.
-  if (Object.keys(data.groups).length === 0) data.groupsCleared = true;
+  // Membership is server-declared now (ADR 0017): deleting the group removes
+  // only James's copy of it. A group whose members still declare it is
+  // re-adopted for rendering, marked server-declared.
   saveGroups(data);
 }
 
@@ -341,40 +342,37 @@ function addToGroup(groupName, sKey) {
     saveGroups(data);
     return;
   }
+  // Membership is the server's to declare (ADR 0017): joining a group is a
+  // server write. The store keeps only where the tile sits inside the group.
+  const session = state.sessions.find((s) => sessionKey(s.name, s.machineHost) === sKey);
+  if (session) declareSessionGroup(session, groupName);
   const data = loadGroups();
-  // Remove from any existing group first
-  for (const [gn, members] of Object.entries(data.groups)) {
-    data.groups[gn] = members.filter((k) => k !== sKey);
-  }
-  data.ungroupedOrder = (data.ungroupedOrder || []).filter((k) => k !== sKey);
-  if (!data.groups[groupName]) {
-    data.groups[groupName] = [];
-    data.order = [...data.order.filter((n) => n !== groupName), groupName];
-  }
-  data.groups[groupName] = [...data.groups[groupName], sKey];
-  saveGroups(data);
+  const at = (data.groups[groupName] || []).length;
+  saveGroups(moveSession(data, sKey, groupName, at));
 }
 
 function removeFromGroup(sKey) {
+  // Membership is the server's to declare (ADR 0017): leaving a group is a
+  // server write. The tile returns to the ungrouped region (bottom) rather
+  // than dropping it.
+  const session = state.sessions.find((s) => sessionKey(s.name, s.machineHost) === sKey);
+  if (session) declareSessionGroup(session, null);
   const data = loadGroups();
-  for (const [gn, members] of Object.entries(data.groups)) {
-    data.groups[gn] = members.filter((k) => k !== sKey);
-  }
-  // Return the tile to the ungrouped region (bottom) rather than dropping it.
-  if (!(data.ungroupedOrder || []).includes(sKey)) {
-    data.ungroupedOrder = [...(data.ungroupedOrder || []), sKey];
-  }
-  saveGroups(data);
+  const at = (data.ungroupedOrder || []).length;
+  saveGroups(moveSession(data, sKey, null, at));
 }
 
 // Move every member to the bottom of the ungrouped region, keeping the
-// (now empty) group so its header stays droppable.
+// (now empty) group so its header stays droppable. Each member's group is
+// cleared on the server: membership is the server's to declare.
 function ungroupAll(groupName) {
-  const data = loadGroups();
-  const members = data.groups[groupName] || [];
-  data.groups[groupName] = [];
-  const existing = new Set(data.ungroupedOrder || []);
-  data.ungroupedOrder = [...(data.ungroupedOrder || []), ...members.filter((k) => !existing.has(k))];
+  let data = loadGroups();
+  for (const key of data.groups[groupName] || []) {
+    const session = state.sessions.find((s) => sessionKey(s.name, s.machineHost) === key);
+    if (session) declareSessionGroup(session, null);
+    const at = (data.ungroupedOrder || []).length;
+    data = moveSession(data, key, null, at);
+  }
   saveGroups(data);
 }
 
@@ -382,14 +380,6 @@ function toggleGroupCollapsed(groupName) {
   const data = loadGroups();
   data.collapsed[groupName] = !data.collapsed[groupName];
   saveGroups(data);
-}
-
-function getSessionGroup(sKey) {
-  const data = loadGroups();
-  for (const [gn, members] of Object.entries(data.groups)) {
-    if (members.includes(sKey)) return gn;
-  }
-  return null;
 }
 
 // --- Sidebar group sync (local-first) ---
@@ -517,6 +507,16 @@ const api = {
   async getSidebarGroups() {
     return fetchJson(apiUrl("/api/sidebar-groups"), {}, { timeoutMs: 4000, retries: 0 });
   },
+  // Declare membership (ADR 0017): the server owns which group a session is
+  // in, so moving a tile into or out of a group is this write, not a store
+  // edit. Local sessions only — a peer's membership is the peer's to declare.
+  async setSessionGroup(name, group) {
+    return fetchJson(apiUrl(`/api/sessions/${encodeURIComponent(name)}/group`), {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ group }),
+    }, { timeoutMs: 7000 });
+  },
   async postSidebarGroups(entry) {
     return fetchJson(apiUrl("/api/sidebar-groups"), {
       method: "POST",
@@ -620,6 +620,7 @@ function renderSessionCard(s, showMachineLabel) {
         </div>
         <div class="session-bottom-row">
           ${taskHtml(s.task)}
+          ${groupBadgeHtml(s)}
           <span class="session-agent">${esc(s.agent || "shell")}</span>
           ${isInterestingCommand(s.currentCommand, s.agent) ? `<span class="session-command">${esc(s.currentCommand)}</span>` : ""}
           ${s.projectPath ? `<span class="session-project">${esc(s.projectPath)}</span>` : ""}
@@ -714,6 +715,7 @@ function renderSessions() {
           <span class="drag-handle group-drag-handle" data-drag-handle="group" role="button" aria-label="Drag to reorder group" title="Drag to reorder group">&#10495;</span>
           <span class="group-chevron${isCollapsed ? " collapsed" : ""}">&#9662;</span>
           <span class="group-name">${esc(group.name)}</span>
+          ${serverGroupTagHtml(group)}
           <span class="group-count">${group.sessions.length}</span>
         </div>
         ${isCollapsed ? "" : `<div class="session-group-body">
@@ -968,6 +970,14 @@ function onDragEnd() {
     // Same list: the dragged item is removed before re-insertion, so shift
     // the target index down when moving toward the end.
     if (d.drop.target === d.group && Number.isInteger(index) && d.sourceIndex < index) index -= 1;
+    // Dropping the tile in a different region than the one the server
+    // declares is a membership change, so it is a server write (ADR 0017).
+    // Reordering inside the declared group is the user's own action and
+    // stays in the store.
+    const session = state.sessions.find((s) => sessionKey(s.name, s.machineHost) === d.key);
+    if (session && groupOf(session) !== (d.drop.target ?? null)) {
+      declareSessionGroup(session, d.drop.target ?? null);
+    }
     next = moveSession(gd, d.key, d.drop.target, index);
   }
   saveGroups(next);
@@ -2150,7 +2160,12 @@ function showSessionContextMenu(e, sessionName, machineHost) {
   const sKey = sessionKey(sessionName, machineHost);
   const groupData = getGroups();
   const currentGroup = getSessionGroup(sKey);
-  const groupNames = groupData.order.filter((n) => (groupData.groups[n] || []).length > 0 || n === currentGroup);
+  // The menu offers James's groups and the server-declared ones alike; moving
+  // a tile into either is a server write (ADR 0017).
+  const groupNames = [
+    ...groupData.order.filter((n) => (groupData.groups[n] || []).length > 0 || n === currentGroup),
+    ...(groupData.serverGroups || []).filter((n) => !groupData.order.includes(n)),
+  ];
 
   const items = [];
 

@@ -33,6 +33,16 @@ test("a snapshot's signature changes when a session appears", () => {
   assert.notEqual(snapshotSignature(before), snapshotSignature(after));
 });
 
+test("a snapshot's signature changes when a session's declared group changes", () => {
+  const before = makeSnapshot("working");
+  const after = makeSnapshot("working");
+  // Membership is server-declared (ADR 0017): a session dragged into or out
+  // of a group must reach the feed's subscribers, or a client watching
+  // /ws/status shows a tile in a group the server no longer says it is in.
+  after.sessions[0] = { ...after.sessions[0], group: "Task Factory" };
+  assert.notEqual(snapshotSignature(before), snapshotSignature(after));
+});
+
 test("a snapshot's signature changes when a peer's health changes", () => {
   const before = makeSnapshot("working");
   const after = makeSnapshot("working", { peerStatus: { other: "ok" } });

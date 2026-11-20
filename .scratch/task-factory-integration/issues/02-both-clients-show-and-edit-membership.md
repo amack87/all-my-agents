@@ -30,3 +30,12 @@ A group keeps its members across a restart, and a new member does not reshuffle 
 ## Blocked by
 
 1 — the server owns a session's group and directory
+
+
+## Status
+
+Done on branch `issue/02-both-clients-show-and-edit-membership` (built, both suites green). The
+membership merge lives in `web/public/session-order.js` and
+`Sources/AgentHub/Services/SidebarOrder.swift`, asserted identically by both suites through
+`contract/sidebar-membership.json`. The new server route is
+`POST /api/sessions/{name}/group`; the contract is at version 9.

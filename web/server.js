@@ -1042,6 +1042,35 @@ app.post("/api/sessions/:name/rename", async (req, res) => {
   }
 });
 
+// Declare which group a session belongs to (ADR 0017). Dragging a tile into
+// or out of a group is this write: membership is the server's to declare, so
+// a client asks instead of editing its own copy. `group: null` ungroups the
+// session. A registry entry for the session is updated immediately, so the
+// declaration survives a restart even before the next reconcile pass.
+app.post("/api/sessions/:name/group", (req, res) => {
+  if (!validateTarget(res, req.params.name)) return;
+  const validated = validateSessionGroup((req.body || {}).group);
+  if (!validated.ok) {
+    return res.status(400).json({ error: validated.error });
+  }
+  const name = req.params.name;
+  if (validated.group == null) {
+    sessionGroups.delete(name);
+  } else {
+    sessionGroups.set(name, validated.group);
+  }
+  const registry = registryCache.registry;
+  const entry = registry?.sessions.find((s) => s.tmux === name);
+  if (entry && entry.group !== validated.group) {
+    registry.sessions = registry.sessions.map((s) =>
+      s.tmux === name ? { ...s, group: validated.group } : s
+    );
+    saveRegistry(registry);
+    log("INFO", "Session group declared", { name, group: validated.group });
+  }
+  res.json({ ok: true, name, group: currentGroup(name) });
+});
+
 // Deliver a prompt to a session: type the text into the session's pane as the
 // agent's own input, then press Enter, and file the text with the origin the
 // caller declared — a panel reply is recorded as from the panel, a prompt
