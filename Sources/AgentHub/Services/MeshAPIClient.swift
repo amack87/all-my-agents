@@ -26,6 +26,9 @@ enum MeshAPIClient {
         let group: String?
         /// The directory the session's pane runs in; nil when unknown.
         let dir: String?
+        /// Where the task's workflow stands (ADR 0017/0018). The vocabulary is
+        /// the workflow's own — Task Factory's — so it is carried opaquely.
+        let state: String?
     }
 
     /// Fetch sessions from the web server. Returns nil if the server is unreachable or returns invalid data.
@@ -80,7 +83,8 @@ enum MeshAPIClient {
                 machineHost: s.machineHost,
                 task: s.task,
                 group: s.group,
-                dir: s.dir
+                dir: s.dir,
+                state: s.state
             )
         }
     }

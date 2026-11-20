@@ -25,7 +25,8 @@ struct SessionCreationTests {
             machineHost: machineHost,
             task: nil,
             group: nil,
-            dir: nil
+            dir: nil,
+            state: nil
         )
     }
 

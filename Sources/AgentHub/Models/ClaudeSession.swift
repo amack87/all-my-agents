@@ -26,6 +26,7 @@ struct ClaudeSession: Identifiable, Sendable, Equatable {
     let task: String?          // what the agent says it is doing right now
     let group: String?         // which group the server says the session belongs to (ADR 0017)
     let dir: String?           // the directory the session's pane runs in
+    let state: String?         // the task's state, where its workflow stands (ADR 0017/0018); server-owned, opaque here
 
     /// Whether this session lives on a remote machine (needs WebSocket proxy).
     var isRemote: Bool {

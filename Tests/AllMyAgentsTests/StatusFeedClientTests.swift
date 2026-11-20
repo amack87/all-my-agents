@@ -80,7 +80,8 @@ struct StatusFeedClientTests {
             machineHost: "local",
             task: "Build feature X",
             group: "Work",
-            dir: "/repos/x"
+            dir: "/repos/x",
+            state: nil
         )
         let fromHTTP = MeshAPIClient.mapSessions([mesh])
         let payload = """
@@ -122,7 +123,8 @@ struct StatusFeedClientTests {
             machineHost: nil,
             task: nil,
             group: nil,
-            dir: nil
+            dir: nil,
+            state: nil
         )
         let sessions = MeshAPIClient.mapSessions([mesh])
         #expect(sessions.first?.id == "mesh-local-alpha")

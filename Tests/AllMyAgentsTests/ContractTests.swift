@@ -89,7 +89,7 @@ private enum ContractFixture {
 
 /// The session-fields fixture, read from `contract/session-fields.json`.
 /// Each case is a published session payload; this app's session decoder must
-/// resolve its group and directory exactly as the case expects, the same way
+/// resolve its group, directory and task state exactly as the case expects, the same way
 /// the web app's shape check does.
 private struct SessionFieldsContract: Decodable {
     struct Case: Decodable {
@@ -101,6 +101,7 @@ private struct SessionFieldsContract: Decodable {
         struct Expected: Decodable {
             let group: String?
             let dir: String?
+            let state: String?
         }
     }
 
@@ -128,6 +129,10 @@ private struct SessionFieldsContract: Decodable {
         #expect(
             session.dir == testCase.expected.dir,
             "contract case \"\(testCase.name)\": expected dir \(testCase.expected.dir ?? "nil"), got \(session.dir ?? "nil")"
+        )
+        #expect(
+            session.state == testCase.expected.state,
+            "contract case \"\(testCase.name)\": expected state \(testCase.expected.state ?? "nil"), got \(session.state ?? "nil")"
         )
     }
 }
@@ -199,7 +204,8 @@ private struct MembershipContract: Decodable {
                 machineHost: host,
                 task: nil,
                 group: fixture.group,
-                dir: nil
+                dir: nil,
+                state: nil
             )
         }
         let out = SidebarOrder.resolve(data: testCase.data, sessions: sessions)

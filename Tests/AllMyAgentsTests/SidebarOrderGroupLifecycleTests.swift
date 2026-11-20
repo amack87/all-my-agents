@@ -97,7 +97,8 @@ private func session(_ name: String, group: String?, host: String = "local") -> 
         machineHost: host,
         task: nil,
         group: group,
-        dir: nil
+        dir: nil,
+        state: nil
     )
 }
 

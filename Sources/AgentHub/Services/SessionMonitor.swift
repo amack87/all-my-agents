@@ -167,7 +167,8 @@ final class SessionMonitor {
                     machineHost: nil,
                     task: nil,
                     group: nil,
-                    dir: nil
+                    dir: nil,
+                    state: nil,
                 )
             }
 
@@ -197,7 +198,8 @@ final class SessionMonitor {
                     machineHost: nil,
                     task: nil,
                     group: nil,
-                    dir: nil
+                    dir: nil,
+                    state: nil,
                 ))
             }
 
