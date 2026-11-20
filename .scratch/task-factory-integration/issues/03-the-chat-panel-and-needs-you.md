@@ -1,7 +1,7 @@
 # 3 — The chat panel and "Needs you"
 
 Part of: .scratch/task-factory-integration/spec.md
-Status: ready-for-agent
+Status: done — branch `issue/03-the-chat-panel-and-needs-you`
 Labels: feature
 
 ## What to build
