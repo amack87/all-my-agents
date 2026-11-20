@@ -9,9 +9,22 @@ test("a filed message carries an increasing id, the text and a timestamp", () =>
   const second = store.file("slice", "done");
   assert.ok(second > first, "the id increases within a session");
   const [one, two] = store.messages("slice");
-  assert.deepEqual(one, { id: first, text: "working on it", at: one.at });
+  assert.deepEqual(one, { id: first, text: "working on it", at: one.at, origin: null });
   assert.equal(typeof one.at, "number", "at is ms since the epoch");
-  assert.deepEqual(two, { id: second, text: "done", at: two.at });
+  assert.deepEqual(two, { id: second, text: "done", at: two.at, origin: null });
+});
+
+// Where a message came from is part of the record: a reply typed in the panel
+// is James, text typed into a terminal is not, and a consumer reads the origin
+// to tell them apart. A message filed without an origin has none — that is
+// the honest value for text the server delivered on someone's behalf.
+test("a filed message carries the origin it was filed with, or none", () => {
+  const store = createMessageStore();
+  store.file("slice", "yes, approved", "panel");
+  store.file("slice", "the agent's own text");
+  const [fromPanel, withoutOrigin] = store.messages("slice");
+  assert.equal(fromPanel.origin, "panel");
+  assert.equal(withoutOrigin.origin, null);
 });
 
 test("messages come back oldest first", () => {

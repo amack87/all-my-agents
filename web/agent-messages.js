@@ -8,6 +8,10 @@
 //
 // `id` increases within a session, so a cursor stays stable across reads:
 // `messages(name, since)` is everything after `since`, oldest first.
+//
+// `origin` records where the message came from — "panel" for a reply typed in
+// the chat panel, "agent" for the agent's own reported output, and null when
+// nobody said. Reading it is the consumer's job: the store only records.
 
 export function createMessageStore() {
   // session name → filed messages, oldest first
@@ -15,11 +19,11 @@ export function createMessageStore() {
   // session name → id of the last message filed
   const cursor = new Map();
 
-  function file(name, text) {
+  function file(name, text, origin = null) {
     const list = filed.get(name) ?? [];
     const id = (cursor.get(name) ?? 0) + 1;
     cursor.set(name, id);
-    list.push({ id, text, at: Date.now() });
+    list.push({ id, text, at: Date.now(), origin });
     filed.set(name, list);
     return id;
   }
