@@ -1,7 +1,7 @@
 # 04 — The server carries a task's state
 
 Part of: .scratch/task-factory-integration/spec.md
-Status: ready-for-agent
+Status: done — branch `issue/04-the-server-carries-a-task-state`
 Labels: enhancement
 
 ## What to build
