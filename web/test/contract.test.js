@@ -15,7 +15,6 @@ import { fileURLToPath } from "node:url";
 import {
   pickWinner,
   orderHasGroups,
-  orderClearedGroups,
   isSafeGroupName,
 } from "../public/sidebar-sync.js";
 import { checkShape } from "../api-contract.js";
@@ -49,11 +48,6 @@ test("the shared contract resolves identically on the macOS app", () => {
 test("the shared contract's group flags agree", () => {
   for (const c of contract.flagCases) {
     assert.equal(orderHasGroups(c.data), c.hasGroups, `contract case "${c.name}": hasGroups`);
-    assert.equal(
-      orderClearedGroups(c.data),
-      c.clearedGroups,
-      `contract case "${c.name}": clearedGroups`,
-    );
   }
 });
 

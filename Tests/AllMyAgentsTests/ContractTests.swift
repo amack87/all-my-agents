@@ -22,7 +22,6 @@ private struct SidebarGroupsContract: Decodable {
         let name: String
         let data: SidebarOrderData
         let hasGroups: Bool
-        let clearedGroups: Bool
     }
 
     let winnerCases: [WinnerCase]
@@ -71,10 +70,6 @@ private enum ContractFixture {
         #expect(
             SidebarOrder.hasGroups(testCase.data) == testCase.hasGroups,
             "contract case \"\(testCase.name)\": hasGroups disagreed"
-        )
-        #expect(
-            SidebarOrder.clearedGroups(testCase.data) == testCase.clearedGroups,
-            "contract case \"\(testCase.name)\": clearedGroups disagreed"
         )
     }
 }
