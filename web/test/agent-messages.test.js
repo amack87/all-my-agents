@@ -85,7 +85,7 @@ test("clear drops the history and the cursor with it", () => {
 // points at a stub, so these tests run without a live tmux pane.
 
 process.env.NODE_ENV = "test";
-const { app, agentMessages, surfaceTokens, paneResolution } = await import("../server.js");
+const { app, agentMessages, surfaceTokens, paneResolution, promptDelivery } = await import("../server.js");
 const { checkShape } = await import("../api-contract.js");
 const { readFileSync } = await import("node:fs");
 const { dirname, join } = await import("node:path");
@@ -241,6 +241,114 @@ test("an unmatched event files nothing", async () => {
     assert.equal(statusCode, 422);
     assert.deepEqual(agentMessages.messages("event-slice"), []);
   } finally {
+    surfaceTokens.delete("tok-agent-message");
+    paneResolution.paneFor = realPaneFor;
+  }
+});
+
+// --- A reply typed from the panel is filed with its origin ------------------
+//
+// The send route is where a panel reply is recorded: the route delivers the
+// text to the pane and files it against the session with the origin the
+// caller declared. A reply without a declared origin is still recorded —
+// with none, because "not from the panel" is a fact a consumer reads.
+// Delivery is a seam (promptDelivery), the same way paneFor is.
+
+const realDeliver = promptDelivery.deliver;
+const delivered = async () => {};
+
+test("a delivered reply is filed with the origin the caller declared", async () => {
+  paneResolution.paneFor = livePane;
+  promptDelivery.deliver = delivered;
+  try {
+    const before = agentMessages.latestId("send-slice");
+    const { statusCode } = await call("POST", "/api/sessions/send-slice/send", {
+      text: "yes, approved", origin: "panel",
+    });
+    assert.equal(statusCode, 200);
+    const stored = agentMessages.messages("send-slice", before ?? 0);
+    assert.deepEqual(
+      stored.map((m) => ({ text: m.text, origin: m.origin })),
+      [{ text: "yes, approved", origin: "panel" }],
+      "a panel reply comes back marked as from the panel",
+    );
+  } finally {
+    agentMessages.clear("send-slice");
+    paneResolution.paneFor = realPaneFor;
+    promptDelivery.deliver = realDeliver;
+  }
+});
+
+test("a delivered reply without a declared origin is filed with none", async () => {
+  paneResolution.paneFor = livePane;
+  promptDelivery.deliver = delivered;
+  try {
+    await call("POST", "/api/sessions/send-slice/send", { text: "run the tests" });
+    const [filed] = agentMessages.messages("send-slice");
+    assert.equal(filed.text, "run the tests");
+    assert.equal(filed.origin, null, "text the server delivered for a silent caller is not marked");
+  } finally {
+    agentMessages.clear("send-slice");
+    paneResolution.paneFor = realPaneFor;
+    promptDelivery.deliver = realDeliver;
+  }
+});
+
+test("a reply that cannot claim the panel is refused, and files nothing", async () => {
+  paneResolution.paneFor = livePane;
+  promptDelivery.deliver = delivered;
+  try {
+    const { statusCode } = await call("POST", "/api/sessions/send-slice/send", {
+      text: "hi", origin: "terminal",
+    });
+    assert.equal(statusCode, 400);
+    assert.deepEqual(agentMessages.messages("send-slice"), []);
+  } finally {
+    paneResolution.paneFor = realPaneFor;
+    promptDelivery.deliver = realDeliver;
+  }
+});
+
+test("a reply to a session with no live pane is not filed", async () => {
+  paneResolution.paneFor = async () => null;
+  promptDelivery.deliver = delivered;
+  try {
+    const { statusCode } = await call("POST", "/api/sessions/ghost/send", { text: "hi" });
+    assert.equal(statusCode, 404);
+    assert.deepEqual(agentMessages.messages("ghost"), []);
+  } finally {
+    paneResolution.paneFor = realPaneFor;
+    promptDelivery.deliver = realDeliver;
+  }
+});
+
+test("a reply that fails to deliver is not filed", async () => {
+  paneResolution.paneFor = livePane;
+  promptDelivery.deliver = async () => { throw new Error("tmux refused"); };
+  try {
+    const { statusCode } = await call("POST", "/api/sessions/send-slice/send", {
+      text: "hi", origin: "panel",
+    });
+    assert.equal(statusCode, 500);
+    assert.deepEqual(agentMessages.messages("send-slice"), []);
+  } finally {
+    paneResolution.paneFor = realPaneFor;
+    promptDelivery.deliver = realDeliver;
+  }
+});
+
+test("the agent's own message is filed as from the agent", async () => {
+  surfaceTokens.set("tok-agent-message", "event-slice");
+  paneResolution.paneFor = livePane;
+  try {
+    const { payload } = await call("POST", "/api/events", {
+      event: "stop", surfaceToken: "tok-agent-message", message: "the reply",
+    });
+    const [filed] = agentMessages.messages("event-slice", (payload.messageId ?? 0) - 1);
+    assert.equal(filed.text, "the reply");
+    assert.equal(filed.origin, "agent", "an agent's reported output is marked as the agent's");
+  } finally {
+    agentMessages.clear("event-slice");
     surfaceTokens.delete("tok-agent-message");
     paneResolution.paneFor = realPaneFor;
   }
