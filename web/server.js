@@ -250,17 +250,49 @@ async function tmux(...args) {
   return stdout.trim();
 }
 
+// Readiness config. The window is generous — a slow shell is not a failed
+// launch — and the poll interval is no tighter than the cost of a poll: each
+// `capture-pane` is a process spawn costing a good fraction of a second, so
+// polling at 25 ms only made the check slow to notice a prompt that had
+// already appeared, and sat right on its own deadline.
+const READINESS_TIMEOUT_MS = parseInt(process.env.ALL_MY_AGENTS_READINESS_TIMEOUT_MS || "30000", 10);
+const READINESS_POLL_MS = parseInt(process.env.ALL_MY_AGENTS_READINESS_POLL_MS || "250", 10);
+
+// A shell prompt is a short last line that ends in a prompt character — `❯`,
+// `$`, `%`, `#`, `>`, `»` — with the padding after it trimmed. A login banner
+// or a half-drawn line does not end like that, so it is not ready: typing
+// into it echoes the command twice and can lose characters.
+const PROMPT_RE = /(?:^|[\s~])[$%#>❯»]\s*$/;
+const MAX_PROMPT_LENGTH = 80;
+
+function isShellPrompt(content) {
+  const lines = String(content ?? "").split("\n");
+  let last = "";
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].trim()) { last = lines[i]; break; }
+  }
+  if (!last) return false;
+  const trimmed = last.trimEnd();
+  return trimmed.length <= MAX_PROMPT_LENGTH && PROMPT_RE.test(trimmed);
+}
+
+// Indirection is a seam: the suite points the readiness capture at a stub so
+// readiness tests run without a live tmux pane.
+const paneCapture = { run: (paneId) => tmux("capture-pane", "-t", paneId, "-p") };
+
 // Wait for a pane's shell to draw its first prompt. Typing before the shell
 // has taken over the terminal gets the command echoed twice — once by the tty
-// and once by the shell's line editor. The prompt is normally up within a few
-// tens of milliseconds, so a short bounded poll is enough; a shell that never
-// draws one just falls through to the timeout.
-async function waitForShellPrompt(paneId, timeoutMs = 5000) {
+// and once by the shell's line editor — so the launch waits for a prompt at
+// the end of the pane's content, not merely for any content at all. A shell
+// that never draws one just falls through to the timeout.
+async function waitForShellPrompt(paneId, timeoutMs = READINESS_TIMEOUT_MS, pollMs = READINESS_POLL_MS) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const content = await tmux("capture-pane", "-t", paneId, "-p").catch(() => "");
-    if (content) return true;
-    await new Promise((resolve) => setTimeout(resolve, 25));
+    const content = await paneCapture.run(paneId).catch(() => "");
+    if (isShellPrompt(content)) return true;
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, left)));
   }
   return false;
 }
@@ -293,8 +325,13 @@ async function launchPane({ name, dir, token, command, timeoutMs = 5000 } = {}) 
   if (!command) return paneId;
   // Typing into a shell that has not drawn its prompt yet echoes the command
   // twice and can lose characters, so the launch is abandoned rather than
-  // typed into an unprepared pane.
-  if (!await waitForShellPrompt(paneId, timeoutMs)) {
+  // typed into an unprepared pane. The readiness window is the readiness
+  // check's own — a slow shell is not a failed launch.
+  if (!await paneReadiness.waitForShellPrompt(paneId)) {
+    // The half-created session is destroyed before the error is returned, so
+    // no orphan tmux session, registry entry or sidebar tile survives a
+    // failed launch.
+    await tmuxOps.run("kill-session", "-t", paneId).catch(() => {});
     throw new Error("the pane's shell never became ready");
   }
   await execFileAsync(TMUX, buildLaunchInputArgs(paneId, command), { timeout: timeoutMs });
@@ -305,6 +342,18 @@ async function launchPane({ name, dir, token, command, timeoutMs = 5000 } = {}) 
 // Indirection is a seam: the suite points the pane launch at a stub so route
 // tests run without a live tmux pane.
 const launching = { pane: launchPane };
+
+// The same seam for the readiness check the launch waits on. The suite points
+// the capture at a stub so readiness tests run without a live tmux pane, and
+// holds the readiness constants so a test can pin the window and the poll
+// interval against regressing.
+const paneReadiness = {
+  waitForShellPrompt,
+  isShellPrompt,
+  paneCapture,
+  pollMs: READINESS_POLL_MS,
+  timeoutMs: READINESS_TIMEOUT_MS,
+};
 
 // The same seam for the tmux session commands a route issues itself —
 // rename-session, kill-session. The suite points run at a stub so those
@@ -2297,7 +2346,7 @@ export function isTrustedSocket({ remoteAddress, localAddress } = {}) {
   });
 }
 
-export { app, agentMessages, surfaceTokens, paneResolution, promptDelivery, sessionGroups, sessionStates, ownerTokens, currentState, launching, tmuxOps };
+export { app, agentMessages, surfaceTokens, paneResolution, promptDelivery, sessionGroups, sessionStates, ownerTokens, currentState, launching, tmuxOps, paneReadiness };
 if (process.env.NODE_ENV !== "test") {
   // The contract is a public surface: refuse to serve one that lies about a
   // route rather than start with it.

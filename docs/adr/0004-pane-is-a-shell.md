@@ -27,7 +27,8 @@ The pane is a shell. AMA creates the pane, waits for the shell to be ready, then
 - The pane is created with `new-session -d -P -F '#{pane_id}'`, so the new pane can be addressed unambiguously. tmux resolves a bare target that looks like a number as a *window index of the current session*, not as a session name, so addressing by pane id is not optional.
 - The command is sent with `send-keys -l -- <command>`. `-l` sends the characters literally, so spaces and quotes survive; `--` stops a command that begins with a dash from being read as options.
 - Enter is a separate `send-keys` call. With `-l`, the word `Enter` would be sent as literal text.
-- The shell must have drawn its prompt before anything is typed. Typing earlier echoes the command twice — once by the tty and once by the shell's line editor — so the pane waits for a non-empty `capture-pane`, polling every 25ms up to a 5s cap.
+- The shell must have drawn its prompt before anything is typed. Typing earlier echoes the command twice — once by the tty and once by the shell's line editor — so the pane waits for a **shell prompt** at the end of the pane's content, polling `capture-pane` every 250 ms (no tighter than the cost of a poll) up to a 30 s cap. A slow shell is not a failed launch; a login banner or a half-drawn line is not ready.
+- When the shell never draws its prompt, the half-created tmux session is destroyed before the error is returned: no orphan session, no registry entry, no tile in the sidebar that looks alive but never runs anything.
 
 Restored sessions take the same path: the agent command is typed into a fresh shell in the recorded directory.
 
