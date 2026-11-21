@@ -46,6 +46,8 @@ Task state is stored **in the macOS app**, fed from the server's event stream. T
 - **Provenance** — a task only reaches the server from the holder of that session's surface
   token (ADR-0016), so the text the app renders for a session was written by that session's
   own agent, not by a caller that merely knew its session id.
+  The server re-learns or mints that token when it has to (ADR-0019), but the agent still has
+  to be the one holding it: a caller who knows only a session id cannot write a task.
 
 The app never persists the task. It is re-read from the server on the next snapshot, so a task
 survives an **app** restart for as long as the **server** is still running (the server holds

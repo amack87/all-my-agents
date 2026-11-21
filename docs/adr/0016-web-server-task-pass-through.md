@@ -110,6 +110,12 @@ and `web/integrations/opencode/ama-status.js` post status events — but both al
 surface token when they have one, so extending them to report a task brings the credential the
 channel requires. An agent that has no token may still report status; its tasks are refused.
 
+The token the rule names is one the server issued. A server restart forgets the tokens it
+minted ([ADR 0019](0019-the-server-re-learns-a-surface-token-it-forgot.md)), so the server
+re-learns the token a pane still holds rather than minting a second one, and mints one for a
+session that has none when that session is first contacted. Either way the token in the
+author's hand is the one the server knows for that session.
+
 ## Alternatives considered
 
 #### A. Server infers task state from screen content
@@ -169,6 +175,11 @@ step if task history is wanted, and it belongs with the app, not the server.
   token. That is pre-existing and unchanged here, so anything that can reach the server can
   report a status for a session it does not own. Tightening it belongs to a decision about
   `/api/events` as a whole.
+
+- A **foreign session running only Claude Code** can never trigger the mint: the hook has
+  neither a session id nor a token, so it reports nothing at all, and the session stays
+  token-less until something else reports for it
+  ([ADR 0019](0019-the-server-re-learns-a-surface-token-it-forgot.md)).
 
 ## Implementation Checklist
 

@@ -20,7 +20,13 @@
 // is what the unit tests import. The pure mapping helpers the tests need
 // hang off that function as `AmaStatusPlugin.helpers`.
 
+import { execFileSync } from "node:child_process";
+
 const POST_TIMEOUT_MS = 1500;
+// Must match SURFACE_TOKEN_ENV in ../../surface-token.js.
+const SURFACE_TOKEN_ENV = "AMA_SURFACE_TOKEN";
+const TMUX_TIMEOUT_MS = 500;
+
 
 const BUS_EVENTS = {
   "session.created": "sessionStart",
@@ -68,9 +74,49 @@ function resolveBaseUrl(env) {
 // The pane's surface token. AMA exports it into the pane it launches, so an
 // agent running in an AMA-managed pane can name itself exactly, instead of
 // being identified by a session id that anything else could guess.
-function resolveToken(env) {
-  const token = env?.AMA_SURFACE_TOKEN;
-  return typeof token === "string" && token !== "" ? token : null;
+// The token in the pane's own environment, if the process inherited it.
+function tokenFromEnv(env) {
+  if (!env) return null;
+  const token = env[SURFACE_TOKEN_ENV];
+  return typeof token === "string" && token.length > 0 ? token : null;
+}
+
+// A pane AMA did not launch has no token in the process environment, but the
+// session may still hold one: `tmux set-environment` publishes a token to the
+// session, so a process started after that sees it. The environment lives on
+// the SESSION, not the pane, so the pane's session is resolved first.
+function readTokenFromTmux(env) {
+  const pane = env?.TMUX_PANE;
+  if (!pane) return null;
+  try {
+    const session = execFileSync("tmux", ["display-message", "-p", "-t", pane, "#{session_name}"], {
+      encoding: "utf8",
+      timeout: TMUX_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!session) return null;
+    const output = execFileSync("tmux", ["show-environment", "-t", session, SURFACE_TOKEN_ENV], {
+      encoding: "utf8",
+      timeout: TMUX_TIMEOUT_MS,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    for (const line of String(output).split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith(`${SURFACE_TOKEN_ENV}=`)) continue;
+      const value = trimmed.slice(SURFACE_TOKEN_ENV.length + 1);
+      return value.length > 0 ? value : null;
+    }
+  } catch {
+    // No tmux, or the session is gone. Either way there is no token.
+  }
+  return null;
+}
+
+// The token the pane reports with: the one it inherited, or the one its
+// session holds. `readTmux` is injectable so the fallback can be tested
+// without tmux.
+function resolveToken(env, { readTmux = readTokenFromTmux } = {}) {
+  return tokenFromEnv(env) ?? readTmux(env);
 }
 
 // The body AMA's event endpoint accepts: an event, the session it is about,

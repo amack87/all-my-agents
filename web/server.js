@@ -24,6 +24,7 @@ import { EVENT_TYPES, applyEvent, eventStatus, resolveIdentity } from "./agent-e
 import { applyTaskUpdate } from "./task.js";
 import { createMessageStore } from "./agent-messages.js";
 import { newSurfaceToken, buildLaunchArgs, buildLaunchInputArgs, buildLaunchSubmitArgs } from "./surface-token.js";
+import { SURFACE_TOKEN_ENV, parseSurfaceToken, planAdoptions } from "./surface-token-recovery.js";
 import { validateSendBody, sendPromptCalls } from "./send-prompt.js";
 import { validateLaunchCommand, buildLaunchSpec, renderLaunchCommand } from "./launch-command.js";
 import { isTrustedConnection } from "./network-access.js";
@@ -747,6 +748,100 @@ function saveSidebarGroups(entry) {
 // overrides screen detection while fresh.
 const eventStates = new Map(); // session name or pane id → { status, updatedAt }
 const surfaceTokens = new Map(); // surface token → session name (minted at pane launch)
+// A restart forgets every token the server minted; the panes do not forget
+// theirs. These records let the server re-learn a token it already gave a
+// pane (ADR 0019) instead of minting a second one the running agent cannot
+// know about.
+const sweptTokens = new Set(); // tokens a sweep has already looked for
+const mintAttempts = new Map(); // session name → when a token was last minted
+let lastSweepAt = 0;
+const SURFACE_TOKEN_MIN_INTERVAL_MS = Number(process.env.ALL_MY_AGENTS_SURFACE_TOKEN_MIN_INTERVAL_MS || 10_000);
+
+// The token this server knows for a session, if any. More than one token can
+// map to a session (a recovered one beside a minted one); the first will do.
+function knownTokenForName(name) {
+  for (const [token, bound] of surfaceTokens) {
+    if (bound === name) return token;
+  }
+  return null;
+}
+
+// Read the token a pane still holds. tmux keeps the session environment, so a
+// session AMA launched still prints the token it was given.
+async function tmuxSessionToken(name) {
+  try {
+    const out = await tmuxOps.run("show-environment", "-t", name, SURFACE_TOKEN_ENV);
+    return parseSurfaceToken(out);
+  } catch {
+    return null;
+  }
+}
+
+// One sweep: list the live sessions and adopt the token each pane still
+// holds. Additive only — a binding is never revoked or re-pointed (ADR 0019).
+async function sweepSurfaceTokens() {
+  let names = [];
+  try {
+    const out = await tmuxOps.run("list-sessions", "-F", "#{session_name}");
+    names = String(out || "")
+      .split("\n")
+      .map((n) => n.trim())
+      .filter(Boolean);
+  } catch {
+    return { adopted: [] };
+  }
+  const entries = [];
+  for (const name of names) {
+    if (knownTokenForName(name)) continue;
+    const token = await tmuxSessionToken(name);
+    if (token) entries.push({ name, token });
+  }
+  const plan = planAdoptions(entries, surfaceTokens);
+  for (const binding of plan.bindings) surfaceTokens.set(binding.token, binding.name);
+  return { adopted: plan.adopted };
+}
+
+// Make sure the server knows a token for this session: the one it already
+// has, else the one the pane still holds (re-learn), else a fresh one
+// published into the pane's tmux environment (a session the operator started
+// themselves has no token anywhere).
+async function ensureTokenForSession(name, { mint = false } = {}) {
+  const known = knownTokenForName(name);
+  if (known) return known;
+  const held = await tmuxSessionToken(name);
+  if (held) {
+    const plan = planAdoptions([{ name, token: held }], surfaceTokens);
+    for (const binding of plan.bindings) surfaceTokens.set(binding.token, binding.name);
+    return knownTokenForName(name);
+  }
+  if (!mint) return null;
+  const now = Date.now();
+  if (now - (mintAttempts.get(name) || 0) < SURFACE_TOKEN_MIN_INTERVAL_MS) return null;
+  mintAttempts.set(name, now);
+  const fresh = newSurfaceToken();
+  try {
+    await tmuxOps.run("set-environment", "-t", name, SURFACE_TOKEN_ENV, fresh);
+  } catch (err) {
+    log("WARN", "Could not publish a surface token", {
+      session: name,
+      error: redactTokens(err.message),
+    });
+    return null;
+  }
+  surfaceTokens.set(fresh, name);
+  return fresh;
+}
+
+// A sweep costs a tmux call per live session, so it is rate limited: once
+// per token (the memo) and at most once per interval (the floor).
+function sweepAllowed(token) {
+  if (sweptTokens.has(token)) return false;
+  const now = Date.now();
+  if (now - lastSweepAt < SURFACE_TOKEN_MIN_INTERVAL_MS) return false;
+  sweptTokens.add(token);
+  lastSweepAt = now;
+  return true;
+}
 // Messages agents report about their own output, keyed by session name. The
 // store is in-memory: a restart loses the history, and the pane capture
 // fallback covers the gap (agent-messages.js, ADR 0013).
@@ -1343,6 +1438,12 @@ app.post("/api/events", async (req, res) => {
     return res.status(400).json({ error: "Malformed event payload" });
   }
 
+  // A token the server has never seen is usually a stale one: the pane kept
+  // its token across a server restart while the server's map forgot it. Look
+  // for it in the panes rather than rejecting the report (ADR 0019).
+  if (surfaceToken && !surfaceTokens.has(surfaceToken) && sweepAllowed(surfaceToken)) {
+    await sweepSurfaceTokens();
+  }
   const identity = resolveIdentity(
     { surfaceToken, sessionId },
     {
@@ -1354,6 +1455,11 @@ app.post("/api/events", async (req, res) => {
     return res.status(422).json({ error: "Unmatched", reason: identity.reason });
   }
   const name = identity.name;
+  // Make sure this session has a token the server knows, so the task rule
+  // below is judged against a token the server actually issued. A report for
+  // a session with no token at all is the first contact: the session gets
+  // one, published into its pane (ADR 0019).
+  await ensureTokenForSession(name, { mint: true });
   // The task channel is the agent's own voice: only the holder of this
   // session's surface token may write it. A registry session id is not a
   // secret — anyone who can reach the server can read it from the
@@ -2309,8 +2415,12 @@ app.post("/api/health/restart", (_req, res) => {
 
 // --- Start ---
 function startMaintenance() {
+  // Re-learn the tokens the panes still hold: the server forgot them when
+  // it restarted, the panes did not (ADR 0019).
+  sweepSurfaceTokens().catch(() => {});
   setTimeout(() => {
-    runStartupRestore().catch((err) => log("ERROR", "Startup restore failed", { error: err.message }));
+    runStartupRestore()
+      .then(() => sweepSurfaceTokens())
   }, RESTORE_DELAY_MS).unref();
   // No reconcile before restore: the restore must replay the on-disk registry
   // (recreating dead-known sessions) before the first live scan can prune
