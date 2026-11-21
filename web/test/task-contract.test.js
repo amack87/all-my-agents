@@ -199,25 +199,27 @@ test("an explicit null clears the task", async () => {
 
 // A registry session id is not a secret — it is readable from the
 // unauthenticated GET /api/registry — so it must not authorise a task.
-test("a task reported with only a registry session id is refused", async () => {
+test("a task reported with only a registry session id is not written", async () => {
   const { statusCode, payload } = await postEventRaw({
     event: "stop",
     sessionId: "ses_task_registry",
     task: "Spoofed task",
   });
-  assert.equal(statusCode, 403);
-  assert.ok("error" in payload);
+  // The session has no token of its own, so this is its first contact: the
+  // report is answered and the task is simply not written.
+  assert.equal(statusCode, 200);
+  assert.equal(payload.task, null);
 });
 
-test("a task reported with a token that is not this session's is refused", async () => {
+test("a task reported with a token that is not this session's is not written", async () => {
   const { statusCode, payload } = await postEventRaw({
     event: "stop",
     sessionId: "ses_task_registry",
     surfaceToken: "tok-not-this-session",
     task: "Spoofed task",
   });
-  assert.equal(statusCode, 403);
-  assert.ok("error" in payload);
+  assert.equal(statusCode, 200);
+  assert.equal(payload.task, null);
 });
 
 test("a status event with only a registry session id is still accepted", async () => {

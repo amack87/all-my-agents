@@ -52,7 +52,9 @@ The reason is the same fact as in the Context: `tmux set-environment` reaches on
 
 ### 4. Minting happens on first contact
 
-A session the operator started themselves has no token anywhere. The first report that names it — a status report is enough — mints one, publishes it into that pane's tmux environment, and adopts it. That report is answered without a task; the next one can carry one.
+A session the operator started themselves has no token anywhere. The first report that names it — a status report is enough — mints one, publishes it into that pane's tmux environment, and adopts it. That report is answered without the task: the status it carries is still applied, and the next report can carry a task. The mint only happens for a session name that has passed the server's own validation, so a name the server would reject is never written into a pane.
+
+If the publish fails, the binding is removed and the failure is logged with the token redacted. A failure message carries the whole command line, so the token is in it — and if the publish timed out after tmux applied the value, that token is live in the pane. The token is bound before the publish, and unbound if the publish fails, so redaction always covers it.
 
 The minted token is never echoed to the reporter. The requester triggers the mint; the agent picks the credential up from tmux.
 
@@ -60,9 +62,9 @@ The minted token is never echoed to the reporter. The requester triggers the min
 
 A surface token says *this report comes from this session's own agent*. It does not protect against the operator's own machines: AMA has no authentication ([ADR 0007](0007-what-the-server-does-not-defend-against.md)), the trusted-source gate already trusts the whole tailnet, and a peer on the tailnet can drive the API with a plain `curl` today. A remote peer cannot read this machine's tmux environment, so it still cannot forge a token — but that is the boundary, and it is the gate, not the token.
 
-### 6. Both are rate limited
+### 6. Every path is rate limited
 
-A sweep costs a tmux call per live session and a mint costs a `set-environment`. Both are floored: at most one sweep per `ALL_MY_AGENTS_SURFACE_TOKEN_MIN_INTERVAL_MS` (10 s by default), at most one mint per session per interval, and a token the server has already swept for is never swept for again. A reporter that keeps presenting unknown tokens cannot turn this into a tmux hammer.
+A sweep costs a tmux call per live session, a probe costs one `show-environment`, and a mint costs a `set-environment`. Each is floored: at most one sweep per `ALL_MY_AGENTS_SURFACE_TOKEN_SWEEP_MS` (10 s by default), and at most one probe and one mint per session per `ALL_MY_AGENTS_SURFACE_TOKEN_MIN_INTERVAL_MS` (10 s by default). A token the server has already swept for is not swept for again — and that memo is written only after a sweep that actually worked, so a sweep that failed while tmux was down can be retried, and the memo is bounded. A reporter that keeps presenting unknown tokens cannot turn this into a tmux hammer.
 
 ### 7. The adapters resolve their token at report time
 
@@ -87,6 +89,7 @@ A sweep costs a tmux call per live session and a mint costs a `set-environment`.
 - A session the operator started themselves gets a token on first contact, published into its tmux environment, and can report a task from then on.
 - The server reads tokens out of tmux. That is a new coupling to tmux's session environment, and it is why `tmux show-environment -t <session>` is part of the contract: the variable is the eligibility test — a pane has one only because AMA put it there.
 - The minted token lives in the pane's tmux environment, visible to `tmux show-environment` and to anything running as the same user. It is not visible in the agent's own environment, so the adapters must look for it.
+- A failed publish leaves no binding behind, and the token never reaches the log.
 - A foreign session running **only** Claude Code can never trigger the mint: the hook has neither a session id nor a token, so it reports nothing at all. The session stays token-less until something else reports for it.
 
 ## Implementation Checklist
@@ -95,7 +98,7 @@ A sweep costs a tmux call per live session and a mint costs a `set-environment`.
 - [x] `server.js` re-learns a token on a boot sweep and on a report that presents an unknown token.
 - [x] A session with no token at all is given one on first contact, published into its tmux environment.
 - [x] Both integrations resolve their token at report time, from the environment or from tmux.
-- [x] Both paths are rate limited.
+- [x] Every path is rate limited — the sweep globally, the probe and the mint per session.
 
 ## Related
 

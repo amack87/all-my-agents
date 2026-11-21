@@ -11,7 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,9 +29,10 @@ import {
 const logDir = mkdtempSync(join(tmpdir(), "ama-token-"));
 process.env.ALL_MY_AGENTS_LOG_DIR = logDir;
 process.env.ALL_MY_AGENTS_REGISTRY_POLL_MS = "3600000";
-// The sweep and the mint are rate limited so a spammy reporter cannot turn
-// them into a tmux hammer. The test needs them not to be.
-process.env.ALL_MY_AGENTS_SURFACE_TOKEN_MIN_INTERVAL_MS = "0";
+// The sweep is rate limited so a spammy reporter cannot turn it into a tmux
+// hammer. The test needs it not to be. The probe and the mint keep their
+// own floor — the test asserts that floor.
+process.env.ALL_MY_AGENTS_SURFACE_TOKEN_SWEEP_MS = "0";
 writeFileSync(
   join(logDir, "active-sessions.json"),
   JSON.stringify({
@@ -40,6 +41,9 @@ writeFileSync(
     sessions: [
       { sessionId: "ses_mine", tmux: "mine-slice" },
       { sessionId: "ses_foreign", tmux: "foreign-slice" },
+      { sessionId: "ses_first", tmux: "first-slice" },
+      { sessionId: "ses_fail", tmux: "fail-slice" },
+      { sessionId: "ses_probe", tmux: "probe-slice" },
     ],
   }),
 );
@@ -51,11 +55,16 @@ const { app, surfaceTokens, paneResolution, tmuxOps } = await import("../server.
 const tmuxEnv = new Map(); // session name → "AMA_SURFACE_TOKEN=<token>"
 const tmuxSessions = new Set();
 const published = []; // tokens the server published into a pane
+const tmuxCalls = []; // every tmux call the server made
 
-function stubTmux() {
+function stubTmux({ failList = false, failPublish = false } = {}) {
   tmuxOps.run = async (...args) => {
     const [command] = args;
-    if (command === "list-sessions") return [...tmuxSessions].join("\n");
+    tmuxCalls.push(args);
+    if (command === "list-sessions") {
+      if (failList) throw new Error("tmux is not running");
+      return [...tmuxSessions].join("\n");
+    }
     if (command === "show-environment") {
       const name = args[2];
       const held = tmuxEnv.get(name);
@@ -63,6 +72,10 @@ function stubTmux() {
       return held;
     }
     if (command === "set-environment") {
+      if (failPublish) {
+        // Node's execFile error carries the whole argv — the token included.
+        throw new Error(`Command failed: tmux ${args.join(" ")}`);
+      }
       const name = args[2];
       const token = args[4];
       tmuxEnv.set(name, `${SURFACE_TOKEN_ENV}=${token}`);
@@ -73,8 +86,16 @@ function stubTmux() {
   };
 }
 
+function readCount(name) {
+  return tmuxCalls.filter((a) => a[0] === "show-environment" && a[2] === name).length;
+}
+
+function listCalls() {
+  return tmuxCalls.filter((a) => a[0] === "list-sessions").length;
+}
+
 const realPaneFor = paneResolution.paneFor;
-const livePane = async () => "%9";
+const livePane = async (name) => `%${name}`;
 
 function call(method, url, body) {
   return new Promise((resolve) => {
@@ -92,7 +113,7 @@ function call(method, url, body) {
 async function postEvent(body) {
   paneResolution.paneFor = livePane;
   try {
-    return await call("POST", "/api/events", { event: "working", ...body });
+    return await call("POST", "/api/events", { event: "toolEnd", ...body });
   } finally {
     paneResolution.paneFor = realPaneFor;
   }
@@ -235,4 +256,61 @@ test("a sweep adopts what the panes hold without disturbing what it already know
 
   assert.equal(surfaceTokens.get("tok-a"), "session-a", "the known binding is untouched");
   assert.equal(surfaceTokens.get("tok-b"), "session-b", "the held token was adopted");
+});
+
+test("a first report that carries a task is answered without the task, and keeps its status", async () => {
+  stubTmux();
+  tmuxSessions.add("first-slice");
+
+  const res = await postEvent({ sessionId: "ses_first", task: "Too early" });
+
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.payload.task, null, "the task waits for a token");
+  assert.equal(res.payload.status, "working", "the status still lands");
+});
+
+test("a mint that fails leaves no token behind and none in the log", async () => {
+  stubTmux({ failPublish: true });
+  tmuxSessions.add("fail-slice");
+
+  const res = await postEvent({ sessionId: "ses_fail" });
+
+  assert.equal(res.statusCode, 200);
+  const bound = [...surfaceTokens.entries()].filter(([, name]) => name === "fail-slice");
+  assert.equal(bound.length, 0, "the failed token is not bound to the session");
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const log = readFileSync(join(logDir, "server.log"), "utf8");
+  assert.match(log, /Could not publish a surface token/, "the failure is logged");
+  assert.doesNotMatch(
+    log,
+    /AMA_SURFACE_TOKEN[=\s]+[0-9a-f]{32}/,
+    "no token value is written to the log",
+  );
+  assert.match(log, /\[redacted\]/, "the token in the message is redacted");
+});
+
+test("a sweep that fails does not burn the token that triggered it", async () => {
+  stubTmux({ failList: true });
+  tmuxSessions.add("sweep-slice");
+  const before = listCalls();
+
+  const first = await postEvent({ surfaceToken: "tok-sweep" });
+  assert.equal(first.statusCode, 422);
+  assert.equal(listCalls() - before, 1, "the sweep ran");
+
+  stubTmux();
+  await postEvent({ surfaceToken: "tok-sweep" });
+  assert.equal(listCalls() - before, 2, "the same token can trigger a sweep again");
+});
+
+test("a session with no token is probed once, not once per report", async () => {
+  stubTmux({ failPublish: true });
+  tmuxSessions.add("probe-slice");
+
+  await postEvent({ sessionId: "ses_probe" });
+  assert.equal(readCount("probe-slice"), 1, "the first report probes the pane");
+
+  await postEvent({ sessionId: "ses_probe" });
+  assert.equal(readCount("probe-slice"), 1, "the second report reuses the probe");
 });

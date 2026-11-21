@@ -756,6 +756,9 @@ const sweptTokens = new Set(); // tokens a sweep has already looked for
 const mintAttempts = new Map(); // session name → when a token was last minted
 let lastSweepAt = 0;
 const SURFACE_TOKEN_MIN_INTERVAL_MS = Number(process.env.ALL_MY_AGENTS_SURFACE_TOKEN_MIN_INTERVAL_MS || 10_000);
+// The sweep is global, so it gets its own clock: one sweep at a time for the
+// whole server, whatever else is happening.
+const SURFACE_TOKEN_SWEEP_MS = Number(process.env.ALL_MY_AGENTS_SURFACE_TOKEN_SWEEP_MS || 10_000);
 
 // The token this server knows for a session, if any. More than one token can
 // map to a session (a recovered one beside a minted one); the first will do.
@@ -768,13 +771,23 @@ function knownTokenForName(name) {
 
 // Read the token a pane still holds. tmux keeps the session environment, so a
 // session AMA launched still prints the token it was given.
+// The token a pane still holds, read at most once per interval: a report
+// that arrives every second must not spawn a tmux process every second.
+const tokenProbes = new Map(); // session name → { token, at }
+
 async function tmuxSessionToken(name) {
+  const now = Date.now();
+  const cached = tokenProbes.get(name);
+  if (cached && now - cached.at < SURFACE_TOKEN_MIN_INTERVAL_MS) return cached.token;
+  let token = null;
   try {
     const out = await tmuxOps.run("show-environment", "-t", name, SURFACE_TOKEN_ENV);
-    return parseSurfaceToken(out);
+    token = parseSurfaceToken(out);
   } catch {
-    return null;
+    token = null;
   }
+  tokenProbes.set(name, { token, at: now });
+  return token;
 }
 
 // One sweep: list the live sessions and adopt the token each pane still
@@ -788,7 +801,7 @@ async function sweepSurfaceTokens() {
       .map((n) => n.trim())
       .filter(Boolean);
   } catch {
-    return { adopted: [] };
+    return { adopted: [], ok: false };
   }
   const entries = [];
   for (const name of names) {
@@ -798,7 +811,7 @@ async function sweepSurfaceTokens() {
   }
   const plan = planAdoptions(entries, surfaceTokens);
   for (const binding of plan.bindings) surfaceTokens.set(binding.token, binding.name);
-  return { adopted: plan.adopted };
+  return { adopted: plan.adopted, ok: true };
 }
 
 // Make sure the server knows a token for this session: the one it already
@@ -818,29 +831,46 @@ async function ensureTokenForSession(name, { mint = false } = {}) {
   const now = Date.now();
   if (now - (mintAttempts.get(name) || 0) < SURFACE_TOKEN_MIN_INTERVAL_MS) return null;
   mintAttempts.set(name, now);
+  if (mintAttempts.size > 256) mintAttempts.clear();
   const fresh = newSurfaceToken();
+  // Bind before publishing: redaction only scrubs tokens the server knows, and
+  // a failure message carries the whole command line — the token is in it.
+  surfaceTokens.set(fresh, name);
   try {
     await tmuxOps.run("set-environment", "-t", name, SURFACE_TOKEN_ENV, fresh);
   } catch (err) {
+    const message = redactTokens(err.message);
+    surfaceTokens.delete(fresh);
     log("WARN", "Could not publish a surface token", {
       session: name,
-      error: redactTokens(err.message),
+      error: message,
     });
     return null;
   }
-  surfaceTokens.set(fresh, name);
+  tokenProbes.set(name, { token: fresh, at: Date.now() });
   return fresh;
 }
 
-// A sweep costs a tmux call per live session, so it is rate limited: once
-// per token (the memo) and at most once per interval (the floor).
+// A sweep costs a tmux call per live session, so it is rate limited: at most
+// once per interval. The memo of swept tokens is written only after a sweep
+// actually ran, so a sweep that failed can be retried with the same token.
 function sweepAllowed(token) {
   if (sweptTokens.has(token)) return false;
   const now = Date.now();
-  if (now - lastSweepAt < SURFACE_TOKEN_MIN_INTERVAL_MS) return false;
-  sweptTokens.add(token);
+  if (now - lastSweepAt < SURFACE_TOKEN_SWEEP_MS) return false;
   lastSweepAt = now;
   return true;
+}
+
+// A client can present any number of unknown tokens, so the memo is bounded:
+// the oldest entry is dropped once the set is full.
+const SWEPT_TOKENS_MAX = 64;
+function memoizeSweep(token) {
+  sweptTokens.add(token);
+  while (sweptTokens.size > SWEPT_TOKENS_MAX) {
+    const oldest = sweptTokens.values().next().value;
+    sweptTokens.delete(oldest);
+  }
 }
 // Messages agents report about their own output, keyed by session name. The
 // store is in-memory: a restart loses the history, and the pane capture
@@ -1442,7 +1472,8 @@ app.post("/api/events", async (req, res) => {
   // its token across a server restart while the server's map forgot it. Look
   // for it in the panes rather than rejecting the report (ADR 0019).
   if (surfaceToken && !surfaceTokens.has(surfaceToken) && sweepAllowed(surfaceToken)) {
-    await sweepSurfaceTokens();
+    const swept = await sweepSurfaceTokens();
+    if (swept.ok) memoizeSweep(surfaceToken);
   }
   const identity = resolveIdentity(
     { surfaceToken, sessionId },
@@ -1455,21 +1486,28 @@ app.post("/api/events", async (req, res) => {
     return res.status(422).json({ error: "Unmatched", reason: identity.reason });
   }
   const name = identity.name;
+  if (!TMUX_TARGET_RE.test(name)) {
+    return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
+  }
   // Make sure this session has a token the server knows, so the task rule
   // below is judged against a token the server actually issued. A report for
   // a session with no token at all is the first contact: the session gets
   // one, published into its pane (ADR 0019).
+  const knownBefore = knownTokenForName(name);
   await ensureTokenForSession(name, { mint: true });
   // The task channel is the agent's own voice: only the holder of this
   // session's surface token may write it. A registry session id is not a
   // secret — anyone who can reach the server can read it from the
   // unauthenticated GET /api/registry — so it must not authorise a task.
   // Status events keep the looser rule; a task does not.
-  if (task !== undefined && surfaceTokens.get(surfaceToken) !== name) {
-    return res.status(403).json({ error: "Task requires a surface token" });
-  }
-  if (!TMUX_TARGET_RE.test(name)) {
-    return res.status(422).json({ error: "Unmatched", reason: "unmatched" });
+  let acceptedTask = task;
+  if (acceptedTask !== undefined && surfaceTokens.get(surfaceToken) !== name) {
+    if (knownBefore) {
+      return res.status(403).json({ error: "Task requires a surface token" });
+    }
+    // First contact: the session had no token, so its agent cannot present
+    // one yet. The report is answered; the task waits for the next report.
+    acceptedTask = undefined;
   }
 
   // Map the registry's session name to a live pane id (the key used by
@@ -1496,7 +1534,7 @@ app.post("/api/events", async (req, res) => {
   // keeps the one the session already has — an agent reporting its status
   // must not erase the task it reported a minute ago. An explicit null
   // clears it. The task is trimmed and capped on the way in (task.js).
-  const taskUpdate = applyTaskUpdate(task, currentTask(name, paneId));
+  const taskUpdate = applyTaskUpdate(acceptedTask, currentTask(name, paneId));
   if (taskUpdate.effect !== "keep") {
     setTaskState(name, paneId, taskUpdate.task);
   }
